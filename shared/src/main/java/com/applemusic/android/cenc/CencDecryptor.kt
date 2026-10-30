@@ -12,6 +12,9 @@ import java.util.concurrent.TimeUnit
 /**
  * CENC（ISO/IEC 23001-7）解密器 —— Apple Music 音频。
  *
+ * 核心解密算法与思路参考：
+ *   酷安动态：https://www.coolapk.com/feed/73737066?s=NjdhODM2MDAzN2JlMDhnNmFlNDg3OGN6a1670
+ *
  * 对应鸿蒙版 `CencDecryptor.ets`。实测格式：
  *   schm = 'cenc'（AES-CTR）
  *   tenc.IVSize = 8
