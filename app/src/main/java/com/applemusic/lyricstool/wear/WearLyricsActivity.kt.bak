@@ -1,0 +1,1225 @@
+package com.applemusic.lyricstool.wear
+
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.MaterialTheme as Material3Theme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.wear.compose.foundation.lazy.TransformingLazyColumn
+import androidx.wear.compose.foundation.lazy.itemsIndexed
+import androidx.wear.compose.foundation.lazy.rememberTransformingLazyColumnState
+import androidx.wear.compose.material3.AppScaffold
+import androidx.wear.compose.material3.Button
+import androidx.wear.compose.material3.Card
+import androidx.wear.compose.material3.CompactButton
+import androidx.wear.compose.material3.FilledTonalButton
+import androidx.wear.compose.material3.MaterialTheme as WearMaterialTheme
+import androidx.wear.compose.material3.OutlinedButton
+import androidx.wear.compose.material3.ScrollIndicator
+import androidx.wear.compose.material3.ScreenScaffold
+import androidx.wear.compose.material3.Text
+import androidx.wear.compose.material3.TextButton
+import com.applemusic.android.apple.AppleLibrarySync
+import com.applemusic.android.apple.MusicRepository
+import com.applemusic.android.lyrics.Lyrics
+import com.applemusic.android.player.PlaybackEngine
+import com.applemusic.android.util.Logx
+import com.applemusic.lyricstool.data.AppleLyricsClient
+import com.applemusic.lyricstool.data.LyricsCache
+import com.applemusic.lyricstool.data.QQMusicLyricsClient
+import com.applemusic.lyricstool.data.SongHit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+
+class WearLyricsActivity : ComponentActivity() {
+    private lateinit var tokenStore: EncryptedTokenStore
+    private lateinit var client: AppleLyricsClient
+    private var sessionRevision by mutableStateOf(0)
+    private var startupError by mutableStateOf<String?>(null)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.setBackgroundDrawableResource(android.R.color.black)
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            android.util.Log.e("WearLyricsCrash", "Uncaught exception on thread $thread", throwable)
+            Logx.e("WearLyricsCrash", "Crash: ${throwable.message}", throwable)
+        }
+        try {
+            Logx.init(filesDir)
+            tokenStore = EncryptedTokenStore(applicationContext)
+            client = AppleLyricsClient(applicationContext, tokenStore)
+            MusicRepository.init(
+                applicationContext,
+                WearAppleApiTokenStore(applicationContext, tokenStore)
+            )
+            try {
+                MusicRepository.api.persist(client.userToken)
+            } catch (e: Exception) {
+                Logx.w("WearLyrics", "MusicRepository persist error: ${e.message}")
+            }
+            PlaybackEngine.init(applicationContext, WearMusicService::class.java)
+            try {
+                startService(Intent(this, WearMusicService::class.java))
+            } catch (e: Exception) {
+                Logx.w("WearLyrics", "Could not start service: ${e.message}")
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e("WearLyrics", "Startup error", e)
+            startupError = "${e.javaClass.simpleName}: ${e.message}\n${e.stackTrace.take(5).joinToString("\n")}"
+        }
+
+        setContent {
+            val error = startupError
+            if (error != null) {
+                WearMaterialTheme {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text("应用启动遇到错误：", style = WearMaterialTheme.typography.titleSmall)
+                            Text(error, style = WearMaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            } else {
+                WearLyricsScreen(
+                    client = client,
+                    signedIn = client.isSignedIn,
+                    transferError = tokenStore.transferError(),
+                    sessionRevision = sessionRevision,
+                    onSignOut = {
+                        client.logout()
+                        MusicRepository.api.logout()
+                        sessionRevision++
+                    },
+                    onSessionChanged = {
+                        MusicRepository.api.persist(client.userToken)
+                        sessionRevision++
+                    }
+                )
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::client.isInitialized) {
+            client.reloadSavedSession()
+            if (::tokenStore.isInitialized) MusicRepository.api.persist(client.userToken)
+            sessionRevision++
+        }
+    }
+
+    override fun onDestroy() {
+        PlaybackEngine.onStateChanged = null
+        super.onDestroy()
+    }
+}
+
+private enum class WearPage(val label: String) {
+    Search("搜索"),
+    Library("资料库"),
+    Playlists("歌单")
+}
+
+@Composable
+private fun WearLyricsScreen(
+    client: AppleLyricsClient,
+    signedIn: Boolean,
+    transferError: String?,
+    sessionRevision: Int,
+    onSignOut: () -> Unit,
+    onSessionChanged: () -> Unit
+) {
+    val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val isRoundScreen = configuration.isScreenRound
+    val horizontalPadding = if (isRoundScreen) 10.dp else 6.dp
+    val screenScrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+    val lyricsCache = remember(context) { LyricsCache(context) }
+    val qqMusicClient = remember { QQMusicLyricsClient() }
+    var tokenInput by remember { mutableStateOf("") }
+    var showManualToken by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    var songs by remember { mutableStateOf<List<SongHit>>(emptyList()) }
+    var searchLimit by remember { mutableStateOf(10) }
+    var librarySongs by remember { mutableStateOf(MusicRepository.allSongs().toList()) }
+    var playlists by remember { mutableStateOf(MusicRepository.allPlaylists().toList()) }
+    var selectedPlaylist by remember { mutableStateOf<AppleLibrarySync.PlaylistRow?>(null) }
+    var playlistSongs by remember { mutableStateOf<List<AppleLibrarySync.SongRow>?>(null) }
+    var playlistLoading by remember { mutableStateOf(false) }
+    var playlistTrackLimit by remember { mutableStateOf(5) }
+    var selectedSong by remember { mutableStateOf<SongHit?>(null) }
+    var lyrics by remember { mutableStateOf<Lyrics?>(null) }
+    var lyricsLoading by remember { mutableStateOf(false) }
+    var lyricsStatus by remember { mutableStateOf("") }
+    var lyricsRetryRevision by mutableLongStateOf(0L)
+    var status by remember { mutableStateOf(transferError.orEmpty()) }
+    var adbImportStatus by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var syncing by remember { mutableStateOf(false) }
+    var searchByLyrics by remember { mutableStateOf(false) }
+    var page by remember { mutableStateOf(WearPage.Search) }
+    var libraryLimit by remember { mutableStateOf(5) }
+    var playbackRevision by remember { mutableLongStateOf(0L) }
+    val importTokenFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                try {
+                    val token = withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)
+                            ?.bufferedReader(Charsets.UTF_8)
+                            ?.use { it.readText().trim() }
+                            ?: error("无法读取令牌文件")
+                    }
+                    client.saveUserToken(token)
+                    tokenInput = ""
+                    status = "账号令牌已加密保存"
+                    onSessionChanged()
+                } catch (error: Exception) {
+                    status = "导入令牌文件失败：${error.message ?: "请检查文件"}"
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(sessionRevision, transferError) {
+        if (!signedIn && !transferError.isNullOrBlank()) status = transferError
+        librarySongs = MusicRepository.allSongs().toList()
+        playlists = MusicRepository.allPlaylists().toList()
+    }
+    LaunchedEffect(signedIn) {
+        if (signedIn) return@LaunchedEffect
+        // Only retry a few times when awaiting initial sync, don't spin indefinitely
+        for (i in 0 until 10) {
+            if (client.isSignedIn) {
+                onSessionChanged()
+                break
+            }
+            delay(1500)
+            client.reloadSavedSession()
+        }
+    }
+    LaunchedEffect(showManualToken, screenScrollState.maxValue) {
+        if (showManualToken) screenScrollState.animateScrollTo(screenScrollState.maxValue)
+    }
+    LaunchedEffect(adbImportStatus, screenScrollState.maxValue) {
+        if (adbImportStatus.isNotBlank()) screenScrollState.animateScrollTo(screenScrollState.maxValue)
+    }
+    LaunchedEffect(Unit) {
+        PlaybackEngine.onStateChanged = { playbackRevision++ }
+    }
+    LaunchedEffect(playbackRevision) {
+        if (!signedIn) return@LaunchedEffect
+        val current = PlaybackEngine.currentSong() ?: return@LaunchedEffect
+        val id = current.appleId.ifBlank { current.catalogId }
+        // 只有当用户已经进入某首歌曲播放页时，自动跟进切歌（避免浏览资料库/歌单滑动时被强制刷新跳回）
+        if (id.isBlank() || selectedSong == null || selectedSong?.id == id) return@LaunchedEffect
+        selectedSong = current.toSongHit()
+    }
+    LaunchedEffect(signedIn, selectedSong?.id, lyricsRetryRevision) {
+        val song = selectedSong
+        if (!signedIn || song == null) return@LaunchedEffect
+        lyrics = null
+        lyricsLoading = true
+        lyricsStatus = "正在加载歌词…"
+        try {
+            lyrics = withContext(Dispatchers.IO) {
+                val cachedApple = lyricsCache.get("apple", song.id)?.lyrics
+                if (cachedApple != null && cachedApple.wordTimedLines() > 0) {
+                    return@withContext cachedApple
+                }
+                val appleLyrics = cachedApple ?: client.fetchLyrics(song.id)?.also {
+                    lyricsCache.put("apple", song.id, it)
+                }?.lyrics
+
+                if (appleLyrics != null && appleLyrics.wordTimedLines() > 0) {
+                    return@withContext appleLyrics
+                }
+
+                // QQ Music fallback
+                val cachedQq = lyricsCache.get("qq", song.id)?.lyrics
+                if (cachedQq != null) return@withContext cachedQq
+
+                val localized = try {
+                    client.fetchChineseSongMetadata(song)
+                } catch (_: Exception) {
+                    null
+                }
+                val qqLyrics = try {
+                    qqMusicClient.fetchMatchingLyrics(
+                        title = song.title,
+                        artist = song.artist,
+                        durationMs = song.durationMs,
+                        album = song.album,
+                        localizedAliases = listOfNotNull(localized)
+                    )?.also {
+                        lyricsCache.put("qq", song.id, it)
+                    }?.lyrics
+                } catch (_: Exception) {
+                    null
+                }
+
+                qqLyrics ?: appleLyrics
+            }
+            lyricsStatus = if (lyrics == null) "这首歌暂时没有可用歌词" else ""
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            lyricsStatus = "歌词加载失败：${error.message ?: "请重试"}"
+        } finally {
+            lyricsLoading = false
+        }
+    }
+
+    Material3Theme(
+        colorScheme = darkColorScheme(
+            background = Color.Black,
+            surface = Color(0xFF1E1E1E),
+            onBackground = Color.White,
+            onSurface = Color.White,
+            primary = Color(0xFFD0BCFF)
+        )
+    ) {
+        WearMaterialTheme {
+            AppScaffold(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+            ) {
+                ScreenScaffold(
+                    scrollIndicator = {
+                        ScrollIndicator(state = screenScrollState)
+                    }
+                ) { contentPadding ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                            .verticalScroll(screenScrollState)
+                            .padding(contentPadding)
+                            .padding(horizontal = horizontalPadding),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "Lyrics",
+                            style = if (isRoundScreen) {
+                                WearMaterialTheme.typography.titleMedium
+                            } else {
+                                WearMaterialTheme.typography.titleLarge
+                            },
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (!signedIn) {
+                            Card(
+                                onClick = {},
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text(
+                                        "已连手机？在手机 Lyrics 设置 → 独立使用 Wear OS 版 → 直接发送令牌",
+                                        style = WearMaterialTheme.typography.bodySmall,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                            status.takeIf { it.isNotBlank() }?.let {
+                                Text(
+                                    it,
+                                    style = WearMaterialTheme.typography.bodySmall,
+                                    color = WearMaterialTheme.colorScheme.primary,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            FilledTonalButton(
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    try {
+                                        importTokenFile.launch(arrayOf("text/plain", "application/octet-stream"))
+                                    } catch (error: ActivityNotFoundException) {
+                                        status = "此手表没有文件选择器。请从已连接手机直接发送，或手动输入令牌。"
+                                        showManualToken = true
+                                    }
+                                }
+                            ) {
+                                Text("选择令牌文件")
+                            }
+                            OutlinedButton(
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = { showManualToken = !showManualToken }
+                            ) {
+                                Text(if (showManualToken) "收起手动输入" else "手动输入令牌")
+                            }
+                            if (
+                                context.applicationInfo.flags and
+                                    android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+                            ) {
+                                FilledTonalButton(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    onClick = {
+                                        adbImportStatus = "正在导入测试令牌…"
+                                        scope.launch {
+                                            try {
+                                                val tokenFile = File(
+                                                    context.getExternalFilesDir(null)
+                                                        ?: error("手表应用存储不可用"),
+                                                    "lyrics-account-token.txt"
+                                                )
+                                                val token = withContext(Dispatchers.IO) {
+                                                    if (!tokenFile.isFile) {
+                                                        error("未找到测试令牌。请先将新导出的文件复制到手表应用目录。")
+                                                    }
+                                                    tokenFile.readText(Charsets.UTF_8).trim()
+                                                }
+                                                if (token.length < 50) {
+                                                    val removed = withContext(Dispatchers.IO) {
+                                                        !tokenFile.exists() || tokenFile.delete()
+                                                    }
+                                                    error(
+                                                        if (removed) {
+                                                            "测试文件无效，已删除临时文件"
+                                                        } else {
+                                                            "测试文件无效，且未能删除明文文件"
+                                                        }
+                                                    )
+                                                }
+                                                client.saveUserToken(token)
+                                                val plaintextRemoved = withContext(Dispatchers.IO) {
+                                                    !tokenFile.exists() || tokenFile.delete()
+                                                }
+                                                tokenInput = ""
+                                                adbImportStatus = if (plaintextRemoved) {
+                                                    "导入成功，令牌已加密保存"
+                                                } else {
+                                                    "登录已导入，但明文文件未能删除，请立即在电脑上删除"
+                                                }
+                                                onSessionChanged()
+                                            } catch (error: Exception) {
+                                                adbImportStatus = "导入失败：${error.message ?: "请重试"}"
+                                            }
+                                        }
+                                    }
+                                ) {
+                                    Text("ADB 测试文件导入")
+                                }
+                                adbImportStatus.takeIf { it.isNotBlank() }?.let {
+                                    Text(
+                                        it,
+                                        style = WearMaterialTheme.typography.bodySmall,
+                                        color = WearMaterialTheme.colorScheme.primary,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                            }
+                            if (showManualToken) {
+                                OutlinedTextField(
+                                    value = tokenInput,
+                                    onValueChange = { tokenInput = it.trim() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("Apple Music 令牌") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = Color.White,
+                                        unfocusedTextColor = Color.White,
+                                        focusedBorderColor = WearMaterialTheme.colorScheme.primary,
+                                        unfocusedBorderColor = Color(0xFF555555),
+                                        focusedLabelColor = WearMaterialTheme.colorScheme.primary,
+                                        unfocusedLabelColor = Color(0xFFAAAAAA),
+                                        cursorColor = WearMaterialTheme.colorScheme.primary,
+                                        focusedContainerColor = Color(0xFF1E1E1E),
+                                        unfocusedContainerColor = Color(0xFF1E1E1E)
+                                    ),
+                                    singleLine = true
+                                )
+                                Button(
+                                    enabled = !busy && tokenInput.length >= 50,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    onClick = {
+                                        try {
+                                            client.saveUserToken(tokenInput)
+                                            tokenInput = ""
+                                            status = "账号令牌已加密保存"
+                                            onSessionChanged()
+                                        } catch (error: Exception) {
+                                            status = "无法安全保存令牌：${error.message ?: "请重试"}"
+                                        }
+                                    }
+                                ) {
+                                    Text("保存并连接")
+                                }
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                WearPage.entries.forEach { target ->
+                                    val onSelectPage = {
+                                        page = target
+                                        selectedPlaylist = null
+                                        playlistSongs = null
+                                        selectedSong = null
+                                    }
+                                    if (page == target) {
+                                        FilledTonalButton(
+                                            modifier = Modifier.weight(1f).widthIn(min = 0.dp),
+                                            onClick = onSelectPage
+                                        ) {
+                                            Text(target.label, maxLines = 1, style = WearMaterialTheme.typography.labelSmall)
+                                        }
+                                    } else {
+                                        OutlinedButton(
+                                            modifier = Modifier.weight(1f).widthIn(min = 0.dp),
+                                            onClick = onSelectPage
+                                        ) {
+                                            Text(target.label, maxLines = 1, style = WearMaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+
+                    when (page) {
+                        WearPage.Search -> {
+                            selectedSong?.let { song ->
+                                NowPlayingPanel(
+                                    song = song,
+                                    lyrics = lyrics,
+                                    lyricsLoading = lyricsLoading,
+                                    lyricsStatus = lyricsStatus,
+                                    isRoundScreen = isRoundScreen,
+                                    onRetryLyrics = { lyricsRetryRevision++ },
+                                    onBack = {
+                                        selectedSong = null
+                                        lyrics = null
+                                        lyricsStatus = ""
+                                    },
+                                    onPlay = { playSongs(listOf(song), 0) },
+                                    onToggle = PlaybackEngine::toggle,
+                                    onPrevious = PlaybackEngine::prev,
+                                    onNext = PlaybackEngine::next
+                                )
+                            } ?: run {
+                                val onSearch: () -> Unit = {
+                                    busy = true
+                                    status = ""
+                                    scope.launch {
+                                        try {
+                                            songs = withContext(Dispatchers.IO) {
+                                                if (searchByLyrics) {
+                                                    client.searchSongsByLyrics(
+                                                        query.trim(),
+                                                        QQMusicLyricsClient()
+                                                    )
+                                                } else {
+                                                    client.searchSongs(query.trim())
+                                                }
+                                            }
+                                            selectedSong = null
+                                            lyrics = null
+                                            if (songs.isEmpty()) status = "没有找到歌曲"
+                                        } catch (error: Exception) {
+                                            status = "搜索失败：${error.message ?: "请重试"}"
+                                        } finally {
+                                            busy = false
+                                        }
+                                    }
+                                }
+                                OutlinedTextField(
+                                    value = query,
+                                    onValueChange = { query = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("搜索歌曲") },
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedTextColor = Color.White,
+                                        unfocusedTextColor = Color.White,
+                                        focusedBorderColor = WearMaterialTheme.colorScheme.primary,
+                                        unfocusedBorderColor = Color(0xFF555555),
+                                        focusedLabelColor = WearMaterialTheme.colorScheme.primary,
+                                        unfocusedLabelColor = Color(0xFFAAAAAA),
+                                        cursorColor = WearMaterialTheme.colorScheme.primary,
+                                        focusedContainerColor = Color(0xFF1E1E1E),
+                                        unfocusedContainerColor = Color(0xFF1E1E1E)
+                                    ),
+                                    singleLine = true
+                                )
+                                Button(
+                                    enabled = !busy && query.isNotBlank(),
+                                    onClick = onSearch,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("搜索")
+                                }
+                                TextButton(
+                                    onClick = { searchByLyrics = !searchByLyrics },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(if (searchByLyrics) "歌词搜索：开" else "歌词搜索：关")
+                                }
+                                val displayedSearchResults = songs.take(searchLimit)
+                                displayedSearchResults.forEach { song ->
+                                    SongCard(
+                                        title = song.title,
+                                        artist = song.artist,
+                                        onClick = {
+                                            selectedSong = song
+                                            lyrics = null
+                                            lyricsStatus = ""
+                                            status = ""
+                                        },
+                                        onPlay = { playSongs(displayedSearchResults, displayedSearchResults.indexOf(song)) }
+                                    )
+                                }
+                                if (songs.size > searchLimit) {
+                                    OutlinedButton(
+                                        onClick = { searchLimit += 10 },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("加载更多 (还有 ${songs.size - searchLimit} 首)")
+                                    }
+                                }
+                            }
+                        }
+
+                        WearPage.Library -> {
+                            Button(
+                                enabled = !syncing,
+                                onClick = {
+                                    syncing = true
+                                    status = "正在同步资料库…"
+                                    MusicRepository.syncAll { success, message ->
+                                        Handler(Looper.getMainLooper()).post {
+                                            syncing = false
+                                            status = if (success) message else "同步失败：$message"
+                                            librarySongs = MusicRepository.allSongs().toList()
+                                            playlists = MusicRepository.allPlaylists().toList()
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (syncing) "同步中…" else if (librarySongs.isEmpty()) "同步资料库" else "刷新资料库")
+                            }
+                            Text(
+                                "已同步 ${librarySongs.size} 首歌曲",
+                                style = WearMaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            if (librarySongs.isEmpty()) {
+                                Text(
+                                    "点击“同步资料库”加载你的歌曲",
+                                    style = WearMaterialTheme.typography.bodySmall,
+                                    color = Color.Gray,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            } else {
+                                val displayedSongs = librarySongs.take(libraryLimit)
+                                displayedSongs.forEachIndexed { index, row ->
+                                    SongCard(
+                                        title = row.title,
+                                        artist = row.artist,
+                                        onClick = {
+                                            playRows(displayedSongs, index)
+                                            val song = row.toSongHit()
+                                            selectedSong = song
+                                            page = WearPage.Search
+                                            lyrics = null
+                                            lyricsStatus = ""
+                                        },
+                                        onPlay = {
+                                            playRows(displayedSongs, index)
+                                        }
+                                    )
+                                }
+                                if (librarySongs.size > libraryLimit) {
+                                    OutlinedButton(
+                                        onClick = { libraryLimit += 10 },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("加载更多 (还有 ${librarySongs.size - libraryLimit} 首)")
+                                    }
+                                }
+                            }
+                        }
+
+                        WearPage.Playlists -> {
+                            val activePlaylist = selectedPlaylist
+                            val tracks = playlistSongs
+                            if (activePlaylist != null) {
+                                TextButton(
+                                    onClick = {
+                                        selectedPlaylist = null
+                                        playlistSongs = null
+                                        playlistTrackLimit = 5
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("← 返回歌单列表")
+                                }
+                                Text(
+                                    activePlaylist.name,
+                                    style = WearMaterialTheme.typography.titleMedium,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                if (playlistLoading) {
+                                    Text(
+                                        "正在读取曲目…",
+                                        style = WearMaterialTheme.typography.bodySmall,
+                                        color = WearMaterialTheme.colorScheme.primary,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else if (tracks == null || tracks.isEmpty()) {
+                                    Text(
+                                        "这个歌单没有可播放的歌曲",
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else {
+                                    Text(
+                                        "共 ${tracks.size} 首歌曲",
+                                        style = WearMaterialTheme.typography.bodySmall,
+                                        color = WearMaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                    val displayedTracks = tracks.take(playlistTrackLimit)
+                                    displayedTracks.forEachIndexed { index, row ->
+                                        SongCard(
+                                            title = row.title,
+                                            artist = row.artist,
+                                            onClick = {
+                                                playRows(displayedTracks, index)
+                                                selectedSong = row.toSongHit()
+                                                page = WearPage.Search
+                                            },
+                                            onPlay = { playRows(displayedTracks, index) }
+                                        )
+                                    }
+                                    if (tracks.size > playlistTrackLimit) {
+                                        OutlinedButton(
+                                            onClick = { playlistTrackLimit += 10 },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("加载更多 (还有 ${tracks.size - playlistTrackLimit} 首)")
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (playlists.isNotEmpty()) {
+                                    Text(
+                                        "我的歌单 (${playlists.size})",
+                                        style = WearMaterialTheme.typography.titleSmall,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                                Button(
+                                    enabled = !syncing,
+                                    onClick = {
+                                        syncing = true
+                                        status = "正在同步歌单…"
+                                        MusicRepository.syncAll { success, message ->
+                                            Handler(Looper.getMainLooper()).post {
+                                                syncing = false
+                                                status = if (success) message else "同步失败：$message"
+                                                librarySongs = MusicRepository.allSongs().toList()
+                                                playlists = MusicRepository.allPlaylists().toList()
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(if (syncing) "同步中…" else if (playlists.isEmpty()) "同步歌单" else "刷新歌单")
+                                }
+                                if (playlists.isEmpty()) {
+                                    Text(
+                                        "点击“同步歌单”加载你的 Apple Music 歌单",
+                                        style = WearMaterialTheme.typography.bodySmall,
+                                        color = Color.Gray,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                } else {
+                                    playlists.forEach { playlist ->
+                                        Card(
+                                            onClick = {
+                                                selectedPlaylist = playlist
+                                                playlistTrackLimit = 15
+                                                val localTracks = MusicRepository.playlistSongs(playlist.id)
+                                                if (localTracks.isNotEmpty()) {
+                                                    playlistSongs = localTracks
+                                                    playlistLoading = false
+                                                } else {
+                                                    playlistSongs = null
+                                                    playlistLoading = true
+                                                    scope.launch {
+                                                        try {
+                                                            val tracks = withContext(Dispatchers.IO) {
+                                                                val result = MusicRepository.api.getAnyPlaylistTracks(
+                                                                    playlist.id,
+                                                                    100,
+                                                                    0,
+                                                                    playlist.id.startsWith("p.")
+                                                                )
+                                                                result.items.map(MusicRepository::rowOf)
+                                                            }
+                                                            playlistSongs = tracks
+                                                        } catch (error: Exception) {
+                                                            status = "加载歌单失败：${error.message ?: "请重试"}"
+                                                        } finally {
+                                                            playlistLoading = false
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Column(modifier = Modifier.padding(12.dp)) {
+                                                Text(
+                                                    playlist.name,
+                                                    style = WearMaterialTheme.typography.titleSmall
+                                                )
+                                                Text(
+                                                    "${playlist.trackCount} 首歌曲",
+                                                    style = WearMaterialTheme.typography.bodySmall,
+                                                    color = WearMaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    val current = PlaybackEngine.currentSong()
+                    if (selectedSong == null && current != null) {
+                        Card(
+                            onClick = {
+                                selectedSong = current.toSongHit()
+                                page = WearPage.Search
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    if (PlaybackEngine.preparing) {
+                                        "缓冲中：${PlaybackEngine.preparingNote.ifBlank { "正在下载音频…" }}"
+                                    } else {
+                                        "正在播放：${current.title}"
+                                    },
+                                    style = WearMaterialTheme.typography.bodySmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                TransportControls(
+                                    isRoundScreen = isRoundScreen,
+                                    isPlaying = PlaybackEngine.isPlaying(),
+                                    onPrevious = PlaybackEngine::prev,
+                                    onToggle = PlaybackEngine::toggle,
+                                    onNext = PlaybackEngine::next,
+                                    onPlay = PlaybackEngine::toggle
+                                )
+                            }
+                        }
+                    }
+
+                        TextButton(
+                            onClick = {
+                                onSignOut()
+                                songs = emptyList()
+                                selectedSong = null
+                                lyrics = null
+                                status = ""
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("退出账号")
+                        }
+                    }
+
+                    if (busy) {
+                        Text(
+                            "正在连接 Apple Music…",
+                            style = WearMaterialTheme.typography.bodySmall,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    if (signedIn) {
+                        status.takeIf { it.isNotBlank() }?.let {
+                            Text(
+                                it,
+                                style = WearMaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+}
+
+@Composable
+private fun SongCard(
+    title: String,
+    artist: String,
+    onClick: () -> Unit,
+    onPlay: () -> Unit
+) {
+    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 6.dp)
+            ) {
+                Text(
+                    title,
+                    style = WearMaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    artist,
+                    style = WearMaterialTheme.typography.bodySmall,
+                    color = WearMaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            CompactButton(onClick = onPlay) {
+                Text("播放", style = WearMaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun NowPlayingPanel(
+    song: SongHit,
+    lyrics: Lyrics?,
+    lyricsLoading: Boolean,
+    lyricsStatus: String,
+    isRoundScreen: Boolean,
+    onRetryLyrics: () -> Unit,
+    onBack: () -> Unit,
+    onPlay: () -> Unit,
+    onToggle: () -> Unit,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit
+) {
+    var positionMs by remember { mutableLongStateOf(PlaybackEngine.positionMs()) }
+    var isAppResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            isAppResumed = event.targetState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(lyrics != null, isAppResumed) {
+        if (lyrics == null || !isAppResumed) return@LaunchedEffect
+        while (true) {
+            val isPlaying = PlaybackEngine.isPlaying()
+            val isPreparing = PlaybackEngine.preparing
+            positionMs = PlaybackEngine.positionMs()
+            // 正在播放或正在缓冲下载音频时保持刷新，暂停且就绪时 1000ms 挂起节约电量
+            delay(if (isPlaying || isPreparing) 100L else 1000L)
+        }
+    }
+
+    TextButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("← 返回") }
+    Text(
+        song.title,
+        style = WearMaterialTheme.typography.titleMedium,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth()
+    )
+    Text(
+        song.artist,
+        style = WearMaterialTheme.typography.bodySmall,
+        color = WearMaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth()
+    )
+    if (PlaybackEngine.preparing) {
+        Card(
+            onClick = {},
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(vertical = 4.dp, horizontal = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    PlaybackEngine.preparingNote.ifBlank { "正在下载音频缓存…" },
+                    style = WearMaterialTheme.typography.labelSmall,
+                    color = WearMaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    }
+    Text(
+        "歌词",
+        style = WearMaterialTheme.typography.titleSmall,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth()
+    )
+    when {
+        lyricsLoading -> Text(
+            "正在加载歌词…",
+            style = WearMaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+        lyrics == null -> {
+            Text(
+                lyricsStatus.ifBlank { "暂时没有可显示的歌词" },
+                style = WearMaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+            TextButton(onClick = onRetryLyrics, modifier = Modifier.fillMaxWidth()) { Text("重新加载歌词") }
+        }
+        else -> {
+            val activeLine = lyrics.indexAt(positionMs)
+            val firstLine = if (activeLine >= 0) (activeLine - 1).coerceAtLeast(0) else 0
+            val lastLine = (firstLine + 4).coerceAtMost(lyrics.lines.size)
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                lyrics.lines
+                    .withIndex()
+                    .filter { it.index in firstLine until lastLine }
+                    .forEach { (index, line) ->
+                        val sungCharacters = when {
+                            index == activeLine -> line.sungChars(positionMs)
+                            activeLine > index -> line.text.length
+                            else -> 0
+                        }
+                        Text(
+                            buildAnnotatedString {
+                                withStyle(
+                                    SpanStyle(
+                                        color = if (index == activeLine) {
+                                            WearMaterialTheme.colorScheme.primary
+                                        } else {
+                                            WearMaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        fontWeight = if (index == activeLine) {
+                                            FontWeight.Bold
+                                        } else {
+                                            FontWeight.Normal
+                                        }
+                                    )
+                                ) {
+                                    append(line.text.take(sungCharacters))
+                                }
+                                withStyle(
+                                    SpanStyle(
+                                        color = if (index == activeLine) {
+                                            Color.White
+                                        } else {
+                                            WearMaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                ) {
+                                    append(line.text.drop(sungCharacters))
+                                }
+                            },
+                            style = if (index == activeLine) {
+                                WearMaterialTheme.typography.bodyLarge
+                            } else {
+                                WearMaterialTheme.typography.bodySmall
+                            },
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        line.translation?.takeIf(String::isNotBlank)?.let {
+                            Text(
+                                it,
+                                style = WearMaterialTheme.typography.labelSmall,
+                                color = Color.Gray,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+            }
+        }
+    }
+    TransportControls(
+        isRoundScreen = isRoundScreen,
+        isPlaying = PlaybackEngine.isPlaying(),
+        onPrevious = onPrevious,
+        onToggle = onToggle,
+        onNext = onNext,
+        onPlay = onPlay
+    )
+}
+
+@Composable
+private fun TransportControls(
+    isRoundScreen: Boolean,
+    isPlaying: Boolean,
+    onPrevious: () -> Unit,
+    onToggle: () -> Unit,
+    onNext: () -> Unit,
+    onPlay: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        FilledTonalButton(
+            onClick = onPrevious,
+            modifier = Modifier.weight(1f).widthIn(min = 0.dp)
+        ) {
+            Text("上首", style = WearMaterialTheme.typography.labelSmall)
+        }
+        Button(
+            onClick = onToggle,
+            modifier = Modifier.weight(1.2f).widthIn(min = 0.dp)
+        ) {
+            Text(if (isPlaying) "暂停" else "播放", style = WearMaterialTheme.typography.labelSmall)
+        }
+        FilledTonalButton(
+            onClick = onNext,
+            modifier = Modifier.weight(1f).widthIn(min = 0.dp)
+        ) {
+            Text("下首", style = WearMaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+private fun playSongs(queue: List<SongHit>, index: Int) {
+    val rows = queue.map(SongHit::toSongRow)
+    MusicRepository.registerTransient(rows)
+    PlaybackEngine.playQueue(rows.map(AppleLibrarySync.SongRow::uri), index.coerceAtLeast(0))
+}
+
+private fun playRows(rows: List<AppleLibrarySync.SongRow>, index: Int) {
+    MusicRepository.registerTransient(rows)
+    PlaybackEngine.playQueue(
+        rows.map(AppleLibrarySync.SongRow::uri),
+        index.coerceIn(rows.indices)
+    )
+}
+
+private fun SongHit.toSongRow(): AppleLibrarySync.SongRow =
+    AppleLibrarySync.SongRow().also { row ->
+        row.appleId = id
+        row.uri = "apple:$id"
+        row.title = title
+        row.artist = artist
+        row.album = album
+        row.durationMs = durationMs
+        row.coverUrl = artworkUrl
+        row.catalogId = providerSongId.orEmpty()
+        row.isLibrary = false
+    }
+
+private fun AppleLibrarySync.SongRow.toSongHit(): SongHit =
+    SongHit(
+        id = appleId.ifBlank { catalogId },
+        title = title,
+        artist = artist,
+        album = album,
+        artworkUrl = coverUrl,
+        durationMs = durationMs,
+        providerSongId = catalogId.takeIf(String::isNotBlank)
+    )
