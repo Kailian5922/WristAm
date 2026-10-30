@@ -23,6 +23,20 @@
 
 同时附带手机端配套应用 (`:phone`)，通过 WebView 登录 Apple ID 并利用 Google Play Services Wearable 协议一键跨端同步鉴权 Token 至手表，彻底解决智能手表端输入账号繁琐的痛点。
 
+### 📱 界面预览 (Screenshots)
+
+<p align="center">
+  <img src="screenshots/preview_player.jpg" width="210" alt="播放控制页 (Playback Controls)" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="screenshots/preview_lyrics.jpg" width="210" alt="逐字歌词页 (Karaoke Lyrics)" />
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="screenshots/preview_library.jpg" width="210" alt="媒体库 (Media Library)" />
+</p>
+
+<p align="center">
+  <sub><b>播放控制页</b>（Horologist 触控热区与表冠音量） &nbsp;|&nbsp; <b>卡拉OK逐字歌词</b>（强调色扫光与光学居中） &nbsp;|&nbsp; <b>媒体库导航</b>（个性电台与曲库）</sub>
+</p>
+
 ---
 
 ## ✨ 核心特性 (Features)
