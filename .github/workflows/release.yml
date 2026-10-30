@@ -1,0 +1,71 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Release APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APKs
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Prepare Release Artifacts
+        run: |
+          mkdir -p release-apks
+          TAG_NAME="${GITHUB_REF_NAME}"
+          if [[ -z "$TAG_NAME" || "$TAG_NAME" == "main" || "$TAG_NAME" == "master" ]]; then
+            TAG_NAME="v1.0.0"
+          fi
+          
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk "release-apks/WristAm-Wear-${TAG_NAME}.apk"
+          fi
+          if [ -f phone/build/outputs/apk/release/phone-release.apk ]; then
+            cp phone/build/outputs/apk/release/phone-release.apk "release-apks/WristAm-Phone-${TAG_NAME}.apk"
+          fi
+          echo "Built APKs:"
+          ls -lh release-apks/
+
+      - name: Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WristAm-Release-APKs
+          path: release-apks/*.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.0' }}
+          name: "WristAm ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.0' }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-apks/*.apk
