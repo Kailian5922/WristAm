@@ -754,7 +754,7 @@ fun WearLyricsPage(
 
 /**
  * 完整级 Horologist 现代歌词界面（ModernHorologistLyricsScreen）：
- * - 严格遵循 wearlyric- 的 Apple Music 原版视觉与交互规范；
+ * - 严格遵循 Apple Music 原版视觉与交互规范；
  * - 采用主题强调色（accentColor = primary）高亮歌词；
  * - 间距紧凑自然，避免行距过散；
  * - 手动浏览歌词时提高所有歌词行的可读性。

@@ -112,20 +112,16 @@ WristAm/
    - **引用与借鉴**：参考了其对 Apple Music Web API 的逆向接口规范、Widevine CDM 交互流程、曲库管理逻辑以及 QQ 音乐备用歌词接口 (`DESHelper`)。
    - **二次开发**：从原有的原型脚本重构为高度工程化的 Kotlin 协程架构，全面迁移至 Android 现代化流媒体规范；加入了针对土耳其/美区/国区跨区域请求的自动 Storefront 刷新适配与容错兜底机制。
 
-4. **`wearlyric-` (Wear OS 逐字歌词实现)**
-   - **引用与借鉴**：歌词界面的字级别平滑扫光算法（Canvas `clipRect` 与横向插值权重计算）、视口 45% 光学居中滚动定位算法、间奏呼吸动效点 (`AppleMusicInterludeDots`)。
-   - **二次开发**：重构了列表的垂直留白空间（从冗余的 30dp 优化至紧凑舒适的 6~8dp），将硬编码纯白配色改造为全面响应 Wear OS Material 3 动态强调色（Accent Color）；保留并融合了动态高斯模糊流光专辑背景。
-
-5. **[AndroidX Media3](https://developer.android.com/media/media3) / ExoPlayer**
+4. **[AndroidX Media3](https://developer.android.com/media/media3) / ExoPlayer**
    - 官方高性能音视频流媒体播放架构，驱动 HLS/MP4 解密音轨的低功耗后台连续播放。
 
-6. **[Jetpack Compose for Wear OS](https://developer.android.com/training/wearables/compose)**
+5. **[Jetpack Compose for Wear OS](https://developer.android.com/training/wearables/compose)**
    - 全面基于声明式 UI 构建，利用 Wear Material 3 体系打造现代化、高帧率的穿戴设备体验。
 
-7. **[Coil Compose](https://coil-kt.github.io/coil/)**
+6. **[Coil Compose](https://coil-kt.github.io/coil/)**
    - 极轻量的异步图片加载库，负责智能手表端的网络专辑图加载与内存自适应缓存。
 
-8. **[Google Play Services Wearable](https://developers.google.com/android/reference/com/google/android/gms/wearable/package-summary)**
+7. **[Google Play Services Wearable](https://developers.google.com/android/reference/com/google/android/gms/wearable/package-summary)**
    - 手机端与手表端跨设备低功耗数据通信（DataClient / MessageClient / ChannelClient）标准实现。
 
 ---
