@@ -1,13 +1,17 @@
 package com.applemusic.lyricstool.wear.ui.screens
 
+import android.os.Build
 import android.os.SystemClock
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
+import android.view.HapticFeedbackConstants
+import android.view.View
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.foundation.background
-import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -29,51 +33,148 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.semantics.focused
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.max
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.wear.compose.foundation.HierarchicalFocusCoordinator
+import androidx.wear.compose.foundation.lazy.AutoCenteringParams
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
+import androidx.wear.compose.foundation.lazy.ScalingLazyListState
+import androidx.wear.compose.foundation.lazy.ScalingParams
+import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
+import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
+import androidx.wear.compose.foundation.rotary.RotarySnapLayoutInfoProvider
 import androidx.wear.compose.material3.FilledIconButton
 import androidx.wear.compose.material3.FilledTonalIconButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.IconButtonDefaults
 import androidx.wear.compose.material3.MaterialTheme
-import androidx.wear.compose.material3.PickerGroup
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
-import androidx.wear.compose.material3.rememberPickerState
 import com.applemusic.lyricstool.wear.data.formatSleepTimerCountdown
 import com.applemusic.lyricstool.wear.data.formatSleepTimerDuration
 import com.applemusic.lyricstool.wear.viewmodel.PlayerViewModel
 import kotlinx.coroutines.delay
-import java.util.Locale
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 
 private const val COLUMN_HOURS = 0
 private const val COLUMN_MINUTES = 1
-private const val COLUMN_CONFIRM = 2
+private const val WHEEL_REPEAT_CYCLES = 1000
+private const val PICKER_GRADIENT_RATIO = 0.33f
+private const val HAPTIC_MIN_INTERVAL_MS = 24L
+private const val SAMSUNG_ROTARY_ITEM_FOCUS_HAPTIC = 102
+private const val WEAR4_ROTARY_ITEM_FOCUS_HAPTIC = 19
+
+private val TWO_DIGIT_LABELS = Array(60) { index ->
+    if (index < 10) "0$index" else index.toString()
+}
+
+private fun optionIndexFromCenter(centerIndex: Int, optionCount: Int): Int {
+    val mod = centerIndex % optionCount
+    return if (mod < 0) mod + optionCount else mod
+}
+
+/**
+ * 轻量高性能 Horologist 风格滚轮刻度震动：
+ * - 直接在主线程响应 [ScalingLazyListState.centerItemIndex] 真实刻度跳变，彻底解决 Wear Compose
+ *   1.5.0-alpha08 内置旋转震动与刻度脱节、丢帧、慢转无震动以及滑着滑着震动消失的问题；
+ * - 同时覆盖表冠/表圈旋转与手指滑动/惯性甩动，并兼容 Wear OS 3.5 / 4 / 5+ 与三星 Galaxy Watch。
+ */
+private fun performPickerTickHaptic(view: View) {
+    val performed = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE -> {
+            view.performHapticFeedback(HapticFeedbackConstants.SEGMENT_TICK)
+        }
+        Build.MANUFACTURER.contains("Samsung", ignoreCase = true) -> {
+            view.performHapticFeedback(SAMSUNG_ROTARY_ITEM_FOCUS_HAPTIC)
+        }
+        Build.VERSION.SDK_INT == Build.VERSION_CODES.TIRAMISU -> {
+            view.performHapticFeedback(WEAR4_ROTARY_ITEM_FOCUS_HAPTIC)
+        }
+        else -> false
+    }
+    if (!performed) {
+        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
+}
+
+private class PickerHapticController(private val view: View) {
+    private var lastHapticUptimeMs = 0L
+
+    fun tick() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastHapticUptimeMs >= HAPTIC_MIN_INTERVAL_MS) {
+            lastHapticUptimeMs = now
+            performPickerTickHaptic(view)
+        }
+    }
+}
+
+private fun sleepTimerWheelScalingParams(): ScalingParams =
+    ScalingLazyColumnDefaults.scalingParams(
+        edgeScale = 0.45f,
+        edgeAlpha = 1.0f,
+        minElementHeight = 0.0f,
+        maxElementHeight = 0.0f,
+        minTransitionArea = 0.45f,
+        maxTransitionArea = 0.45f,
+        scaleInterpolator = CubicBezierEasing(0.25f, 0.00f, 0.75f, 1.00f),
+        viewportVerticalOffsetResolver = { (it.maxHeight / 5f).toInt() }
+    )
+
+private class WheelRotarySnapLayoutInfoProvider(
+    private val listState: ScalingLazyListState,
+    private val fallbackItemSizePx: Float
+) : RotarySnapLayoutInfoProvider {
+    override val averageItemSize: Float
+        get() = listState.layoutInfo.visibleItemsInfo
+            .firstOrNull()
+            ?.unadjustedSize
+            ?.toFloat()
+            ?.takeIf { it > 0f }
+            ?: fallbackItemSizePx
+
+    override val currentItemIndex: Int
+        get() = listState.centerItemIndex
+
+    override val currentItemOffset: Float
+        get() = listState.centerItemScrollOffset.toFloat()
+
+    override val totalItemCount: Int
+        get() = listState.layoutInfo.totalItemsCount
+}
 
 /**
  * Google Horologist 风格定时播放（睡眠定时）时间选择器：
- * - 基于 Wear Compose Material 3 [PickerGroup] + [rememberPickerState] 双滚轮（小时 : 分钟）；
- * - 严格复用 Horologist TimePicker 的大号数字排版、动态文本宽度测算、表冠/表圈旋转刻度吸附与平滑入场；
+ * - 基于 Wear Compose Foundation [ScalingLazyColumn] + [HierarchicalFocusCoordinator] 轻量化双滚轮；
+ * - 移除首帧同步文本测量、全屏透明度动画重组与每项离屏 GPU 图层，让长按呼出入场动画全程流畅；
+ * - 禁用存在刻度脱节与丢震问题的内置旋转震动，改由 `centerItemIndex` 一对一驱动稳定的表冠/触控刻度反馈；
  * - 未定时默认定位 00:30 并聚焦分钟轮，旋转表冠即可快速微调；已定时则实时展示剩余倒计时并提供一键关闭按钮。
  */
 @Composable
@@ -96,47 +197,35 @@ fun SleepTimerScreen(
         }
     }
 
-    val hourState = rememberPickerState(
-        initialNumberOfOptions = 24,
-        initiallySelectedIndex = initialDuration.first,
-        shouldRepeatOptions = true
+    val hourListState = rememberScalingLazyListState(
+        initialCenterItemIndex = 24 * (WHEEL_REPEAT_CYCLES / 2) + initialDuration.first
     )
-    val minuteState = rememberPickerState(
-        initialNumberOfOptions = 60,
-        initiallySelectedIndex = initialDuration.second,
-        shouldRepeatOptions = true
+    val minuteListState = rememberScalingLazyListState(
+        initialCenterItemIndex = 60 * (WHEEL_REPEAT_CYCLES / 2) + initialDuration.second
     )
 
     var selectedColumn by remember { mutableIntStateOf(COLUMN_MINUTES) }
-    val focusRequesterConfirm = remember { FocusRequester() }
 
-    val hoursContentDescription by remember {
-        derivedStateOf { "${hourState.selectedOptionIndex} 小时" }
-    }
-    val minutesContentDescription by remember {
-        derivedStateOf { "${minuteState.selectedOptionIndex} 分钟" }
-    }
-    val isZeroDuration by remember {
-        derivedStateOf {
-            hourState.selectedOptionIndex == 0 && minuteState.selectedOptionIndex == 0
-        }
-    }
-
-    val fullyDrawn = remember { Animatable(0f) }
-    LaunchedEffect(Unit) {
-        fullyDrawn.animateTo(1f, animationSpec = tween(durationMillis = 150))
-    }
-
+    val view = LocalView.current
+    val hapticController = remember(view) { PickerHapticController(view) }
     val configuration = LocalConfiguration.current
     val isLargeScreen = configuration.screenWidthDp > 225
     val currentDensity = LocalDensity.current
+
+    val selectColumn: (Int) -> Unit = remember(hapticController) {
+        { targetColumn ->
+            if (selectedColumn != targetColumn) {
+                selectedColumn = targetColumn
+                hapticController.tick()
+            }
+        }
+    }
 
     ScreenScaffold(timeText = {}) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
-                .alpha(fullyDrawn.value)
         ) {
             Column(
                 modifier = Modifier.fillMaxSize(),
@@ -152,31 +241,17 @@ fun SleepTimerScreen(
                         fontScale = 1f
                     )
                 ) {
-                    val fixedDensity = LocalDensity.current
-                    val optionTextStyle = MaterialTheme.typography.numeralMedium.copy(
-                        textAlign = TextAlign.Center
-                    )
-                    val optionCellHeight = if (isLargeScreen) 44.dp else 38.dp
-                    val separatorPadding = if (isLargeScreen) 10.dp else 6.dp
-                    val sectionPadding = if (isLargeScreen) 6.dp else 3.dp
-
-                    val textMeasurer = rememberTextMeasurer()
-                    val twoDigitsWidthPx = remember(
-                        fixedDensity.density,
-                        configuration.screenWidthDp,
-                        optionTextStyle
-                    ) {
-                        val measured = textMeasurer.measure(
-                            text = "0123456789",
-                            style = optionTextStyle,
-                            density = fixedDensity
+                    val baseNumeralStyle = MaterialTheme.typography.numeralMedium
+                    val optionTextStyle = remember(baseNumeralStyle) {
+                        baseNumeralStyle.copy(
+                            textAlign = TextAlign.Center,
+                            fontFeatureSettings = "tnum"
                         )
-                        (0..9).maxOf { measured.getBoundingBox(it).width } * 2f
                     }
-                    val optionWidth = max(
-                        with(fixedDensity) { twoDigitsWidthPx.toDp() } + 2.dp,
-                        48.dp
-                    )
+                    val optionWidth = if (isLargeScreen) 64.dp else 58.dp
+                    val optionCellHeight = if (isLargeScreen) 44.dp else 40.dp
+                    val separatorPadding = if (isLargeScreen) 8.dp else 5.dp
+                    val sectionPadding = if (isLargeScreen) 6.dp else 3.dp
 
                     // 顶部状态与当前聚焦列标签
                     Column(
@@ -199,11 +274,7 @@ fun SleepTimerScreen(
                             )
                         }
                         Text(
-                            text = when (selectedColumn) {
-                                COLUMN_HOURS -> "小时"
-                                COLUMN_MINUTES -> "分钟"
-                                else -> "确认"
-                            },
+                            text = if (selectedColumn == COLUMN_HOURS) "小时" else "分钟",
                             style = MaterialTheme.typography.titleSmall.copy(
                                 fontSize = if (isLargeScreen) 15.sp else 14.sp,
                                 fontWeight = FontWeight.SemiBold,
@@ -225,141 +296,275 @@ fun SleepTimerScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
-                        PickerGroup(
-                            selectedPickerIndex = selectedColumn,
-                            onPickerSelected = { selectedColumn = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            autoCenter = false,
-                            separator = {
-                                Text(
-                                    text = ":",
-                                    style = optionTextStyle,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier
-                                        .padding(horizontal = separatorPadding)
-                                        .clearAndSetSemantics {}
-                                )
-                            }
-                        ) {
-                            pickerGroupItem(
-                                pickerState = hourState,
-                                modifier = Modifier
-                                    .width(optionWidth)
-                                    .fillMaxHeight(),
-                                onSelected = {
-                                    selectedColumn = if (selectedColumn != COLUMN_HOURS) {
-                                        COLUMN_HOURS
-                                    } else {
-                                        COLUMN_MINUTES
-                                    }
-                                },
-                                contentDescription = hoursContentDescription,
-                                option = { optionIndex, pickerSelected ->
-                                    SleepTimerPickerOption(
-                                        text = String.format(Locale.US, "%02d", optionIndex),
-                                        textStyle = optionTextStyle,
-                                        selected = pickerSelected,
-                                        cellHeight = optionCellHeight
-                                    )
-                                }
-                            )
+                        SleepTimerWheelPicker(
+                            listState = hourListState,
+                            optionCount = 24,
+                            selected = selectedColumn == COLUMN_HOURS,
+                            onSelect = { selectColumn(COLUMN_HOURS) },
+                            hapticController = hapticController,
+                            optionTextStyle = optionTextStyle,
+                            cellHeight = optionCellHeight,
+                            unitLabel = "小时",
+                            modifier = Modifier
+                                .width(optionWidth)
+                                .fillMaxHeight()
+                        )
 
-                            pickerGroupItem(
-                                pickerState = minuteState,
-                                modifier = Modifier
-                                    .width(optionWidth)
-                                    .fillMaxHeight(),
-                                onSelected = {
-                                    if (selectedColumn != COLUMN_MINUTES) {
-                                        selectedColumn = COLUMN_MINUTES
-                                    } else {
-                                        selectedColumn = COLUMN_CONFIRM
-                                        focusRequesterConfirm.requestFocus()
-                                    }
-                                },
-                                contentDescription = minutesContentDescription,
-                                option = { optionIndex, pickerSelected ->
-                                    SleepTimerPickerOption(
-                                        text = String.format(Locale.US, "%02d", optionIndex),
-                                        textStyle = optionTextStyle,
-                                        selected = pickerSelected,
-                                        cellHeight = optionCellHeight
-                                    )
-                                }
-                            )
-                        }
+                        Text(
+                            text = ":",
+                            style = optionTextStyle,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .padding(horizontal = separatorPadding)
+                                .clearAndSetSemantics {}
+                        )
+
+                        SleepTimerWheelPicker(
+                            listState = minuteListState,
+                            optionCount = 60,
+                            selected = selectedColumn == COLUMN_MINUTES,
+                            onSelect = { selectColumn(COLUMN_MINUTES) },
+                            hapticController = hapticController,
+                            optionTextStyle = optionTextStyle,
+                            cellHeight = optionCellHeight,
+                            unitLabel = "分钟",
+                            modifier = Modifier
+                                .width(optionWidth)
+                                .fillMaxHeight()
+                        )
                     }
 
                     Spacer(Modifier.height(sectionPadding))
                 }
 
-                // 底部确认 / 关闭按钮区
-                val buttonSize = if (isLargeScreen) 48.dp else 44.dp
-                val iconSize = if (isLargeScreen) 24.dp else 22.dp
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (timerState.isActive) {
-                        FilledTonalIconButton(
-                            onClick = {
+                // 底部确认 / 关闭按钮区（独立作用域，滚动滚轮时不触发外层重组）
+                SleepTimerActionButtons(
+                    hourListState = hourListState,
+                    minuteListState = minuteListState,
+                    isTimerActive = timerState.isActive,
+                    isLargeScreen = isLargeScreen,
+                    onCancelTimer = {
+                        playerViewModel.cancelSleepTimer()
+                        onToast("已关闭定时播放", false)
+                        onClose()
+                    },
+                    onConfirmTimer = { h, m ->
+                        if (h == 0 && m == 0) {
+                            if (timerState.isActive) {
                                 playerViewModel.cancelSleepTimer()
                                 onToast("已关闭定时播放", false)
                                 onClose()
-                            },
-                            modifier = Modifier.size(buttonSize),
-                            colors = IconButtonDefaults.filledTonalIconButtonColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                                contentColor = MaterialTheme.colorScheme.onSurface
-                            )
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "关闭定时播放",
-                                modifier = Modifier.size(iconSize)
-                            )
+                            }
+                        } else {
+                            playerViewModel.startSleepTimer(hours = h, minutes = m)
+                            onToast("已开启定时播放：${formatSleepTimerDuration(h, m)}", false)
+                            onClose()
                         }
                     }
-
-                    FilledIconButton(
-                        onClick = {
-                            val h = hourState.selectedOptionIndex
-                            val m = minuteState.selectedOptionIndex
-                            if (h == 0 && m == 0) {
-                                if (timerState.isActive) {
-                                    playerViewModel.cancelSleepTimer()
-                                    onToast("已关闭定时播放", false)
-                                    onClose()
-                                }
-                            } else {
-                                playerViewModel.startSleepTimer(hours = h, minutes = m)
-                                onToast("已开启定时播放：${formatSleepTimerDuration(h, m)}", false)
-                                onClose()
-                            }
-                        },
-                        enabled = !isZeroDuration || timerState.isActive,
-                        colors = IconButtonDefaults.filledIconButtonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary
-                        ),
-                        modifier = Modifier
-                            .size(buttonSize)
-                            .semantics {
-                                focused = (selectedColumn == COLUMN_CONFIRM)
-                            }
-                            .focusRequester(focusRequesterConfirm)
-                            .focusable()
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = "确认定时播放",
-                            modifier = Modifier.size(iconSize)
-                        )
-                    }
-                }
+                )
 
                 Spacer(Modifier.height(10.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun SleepTimerWheelPicker(
+    listState: ScalingLazyListState,
+    optionCount: Int,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    hapticController: PickerHapticController,
+    optionTextStyle: TextStyle,
+    cellHeight: Dp,
+    unitLabel: String,
+    modifier: Modifier = Modifier
+) {
+    val density = LocalDensity.current
+    val backgroundColor = MaterialTheme.colorScheme.background
+    val cellHeightPx = with(density) { cellHeight.toPx() }
+    val currentOnSelect by rememberUpdatedState(onSelect)
+
+    val scalingParams = remember { sleepTimerWheelScalingParams() }
+    val autoCentering = remember { AutoCenteringParams(itemIndex = 0) }
+    val snapLayoutInfoProvider = remember(listState, cellHeightPx) {
+        WheelRotarySnapLayoutInfoProvider(
+            listState = listState,
+            fallbackItemSizePx = cellHeightPx
+        )
+    }
+    val rotaryBehavior = RotaryScrollableDefaults.snapBehavior(
+        scrollableState = listState,
+        layoutInfoProvider = snapLayoutInfoProvider,
+        snapOffset = 0.dp,
+        hapticFeedbackEnabled = false
+    )
+    val flingBehavior = ScalingLazyColumnDefaults.snapFlingBehavior(
+        state = listState,
+        snapOffset = 0.dp
+    )
+
+    // 真实刻度变更一对一震动：表冠快慢旋转、松手回弹与手指拖曳甩动均保持稳定清晰触感
+    LaunchedEffect(listState, hapticController) {
+        snapshotFlow { listState.centerItemIndex }
+            .distinctUntilChanged()
+            .drop(1)
+            .collect {
+                hapticController.tick()
+            }
+    }
+
+    // 切离当前滚轮时立即将选中数字归中对齐，避免未聚焦遮罩裁切半个数字
+    LaunchedEffect(selected) {
+        if (!selected && (listState.isScrollInProgress || listState.centerItemScrollOffset != 0)) {
+            listState.scrollToItem(listState.centerItemIndex, 0)
+        }
+    }
+
+    val totalCount = optionCount * WHEEL_REPEAT_CYCLES
+
+    HierarchicalFocusCoordinator(requiresFocus = { selected }) {
+        Box(
+            modifier = modifier
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(
+                            requireUnconsumed = false,
+                            pass = PointerEventPass.Initial
+                        )
+                        currentOnSelect()
+                    }
+                }
+                .semantics {
+                    contentDescription = unitLabel
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            ScalingLazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .drawWithCache {
+                        val gradientHeight = size.height * PICKER_GRADIENT_RATIO
+                        val topGradient = Brush.verticalGradient(
+                            colors = listOf(backgroundColor, Color.Transparent),
+                            startY = 0f,
+                            endY = gradientHeight
+                        )
+                        val bottomGradient = Brush.verticalGradient(
+                            colors = listOf(Color.Transparent, backgroundColor),
+                            startY = size.height - gradientHeight,
+                            endY = size.height
+                        )
+                        val shimHeight = ((size.height - cellHeightPx) / 2f).coerceAtLeast(0f)
+
+                        onDrawWithContent {
+                            drawContent()
+                            if (selected) {
+                                if (gradientHeight > 0f) {
+                                    drawRect(
+                                        brush = topGradient,
+                                        size = Size(size.width, gradientHeight)
+                                    )
+                                    drawRect(
+                                        brush = bottomGradient,
+                                        topLeft = Offset(0f, size.height - gradientHeight),
+                                        size = Size(size.width, gradientHeight)
+                                    )
+                                }
+                            } else if (shimHeight > 0f) {
+                                drawRect(
+                                    color = backgroundColor,
+                                    size = Size(size.width, shimHeight)
+                                )
+                                drawRect(
+                                    color = backgroundColor,
+                                    topLeft = Offset(0f, size.height - shimHeight),
+                                    size = Size(size.width, shimHeight)
+                                )
+                            }
+                        }
+                    },
+                contentPadding = PaddingValues(0.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                flingBehavior = flingBehavior,
+                userScrollEnabled = true,
+                scalingParams = scalingParams,
+                autoCentering = autoCentering,
+                rotaryScrollableBehavior = rotaryBehavior
+            ) {
+                items(totalCount) { index ->
+                    SleepTimerPickerOption(
+                        text = TWO_DIGIT_LABELS[index % optionCount],
+                        textStyle = optionTextStyle,
+                        selected = selected,
+                        cellHeight = cellHeight
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SleepTimerActionButtons(
+    hourListState: ScalingLazyListState,
+    minuteListState: ScalingLazyListState,
+    isTimerActive: Boolean,
+    isLargeScreen: Boolean,
+    onCancelTimer: () -> Unit,
+    onConfirmTimer: (hours: Int, minutes: Int) -> Unit
+) {
+    val isZeroDuration by remember(hourListState, minuteListState) {
+        derivedStateOf {
+            optionIndexFromCenter(hourListState.centerItemIndex, 24) == 0 &&
+                optionIndexFromCenter(minuteListState.centerItemIndex, 60) == 0
+        }
+    }
+    val buttonSize = if (isLargeScreen) 48.dp else 44.dp
+    val iconSize = if (isLargeScreen) 24.dp else 22.dp
+
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (isTimerActive) {
+            FilledTonalIconButton(
+                onClick = onCancelTimer,
+                modifier = Modifier.size(buttonSize),
+                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "关闭定时播放",
+                    modifier = Modifier.size(iconSize)
+                )
+            }
+        }
+
+        FilledIconButton(
+            onClick = {
+                val h = optionIndexFromCenter(hourListState.centerItemIndex, 24)
+                val m = optionIndexFromCenter(minuteListState.centerItemIndex, 60)
+                onConfirmTimer(h, m)
+            },
+            enabled = !isZeroDuration || isTimerActive,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ),
+            modifier = Modifier.size(buttonSize)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Check,
+                contentDescription = "确认定时播放",
+                modifier = Modifier.size(iconSize)
+            )
         }
     }
 }
