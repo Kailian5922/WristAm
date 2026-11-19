@@ -12,8 +12,23 @@ android {
         applicationId = "com.applemusic.lyricstool"
         minSdk = 24
         targetSdk = 36
-        versionCode = 17
-        versionName = "1.16"
+        versionCode = 18
+        versionName = "2.0"
+    }
+
+    signingConfigs {
+        val ksPath = System.getenv("KEYSTORE_PATH")
+        val ksPass = System.getenv("KEYSTORE_PASSWORD")
+        val kAlias = System.getenv("KEY_ALIAS")
+        val kPass = System.getenv("KEY_PASSWORD")
+        if (!ksPath.isNullOrBlank() && !ksPass.isNullOrBlank() && !kAlias.isNullOrBlank() && !kPass.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = ksPass
+                keyAlias = kAlias
+                keyPassword = kPass
+            }
+        }
     }
 
     compileOptions {
@@ -37,7 +52,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 }

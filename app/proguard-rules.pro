@@ -1,13 +1,17 @@
-# Keep data models
--keep class com.applemusic.android.apple.** { *; }
--keep class com.applemusic.lyrics.core.** { *; }
--keep class com.applemusic.shared.** { *; }
+# Wear OS (:app) ProGuard / R8 rules
 
-# Keep Media3 / ExoPlayer
--keep class androidx.media3.** { *; }
--dontwarn androidx.media3.**
-
-# Keep Wearable Data Client and Services
--keep class com.google.android.gms.wearable.** { *; }
+# Keep Android manifest components & reflective entrypoints
+-keep class com.applemusic.lyricstool.wear.WristAmApplication { *; }
+-keep class com.applemusic.lyricstool.wear.WearLyricsActivity { *; }
 -keep class com.applemusic.lyricstool.wear.WearTokenListenerService { *; }
 -keep class com.applemusic.lyricstool.wear.WearMusicService { *; }
+
+# Keep AndroidX Lifecycle ViewModel constructors invoked by ViewModelProvider
+-keepclassmembers class * extends androidx.lifecycle.ViewModel {
+    <init>(...);
+}
+
+# Consumer rules from :shared, Media3, and Play Services Wearable handle library internals
+-dontwarn com.google.android.gms.wearable.**
+-dontwarn androidx.media3.**
+-dontwarn androidx.wear.compose.**

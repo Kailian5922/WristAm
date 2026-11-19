@@ -9,23 +9,25 @@ import com.applemusic.android.hls.HlsMediaInfo
 import com.applemusic.android.hls.HlsParser
 import com.applemusic.android.mp4.Mp4Cleaner
 import com.applemusic.android.mp4.Mp4Remuxer
+import com.applemusic.android.net.Http
 import com.applemusic.android.util.ByteOps
 import com.applemusic.android.util.Logx
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Apple Music 下载器（单曲六步流水线）—— 对应鸿蒙版 `AppleDownloader.ets`。
+ * Apple Music 下载器（单曲六步流水线）。
  *
  *   ① getWebPlayback  取资产清单（flavor 挑一条）
  *   ② 下子清单（m3u8）→ HlsParser 解析：keyUri / init 段 / 分片列表
- *   ③ fetchKey        Widevine license 交换（**必须用 catalog id**）
- *   ④ downloadMedia   按 Range 拉整段音频字节（并发分片）
+ *   ③ fetchKey        Widevine license 交换（必须用 catalog id）
+ *   ④ downloadMedia   按 Range 并发拉取整段音频字节（严格校验 HTTP 206 与分片字节长度）
  *   ⑤ CencDecryptor   逐 sample AES-CTR 解密
- *   ⑥ Mp4Cleaner      ftyp brand 归一 + 删 moov 里的 pssh → 原子写文件
- *
- * 【坑】资料库 id（i.xxx）在 webPlayback 返回里会被换成 catalog id（数字），
- *      license 必须用后者，否则返回 `{"status":-1003}`。
+ *   ⑥ Mp4Cleaner/Remuxer 去 DRM 标记 + 重封装为标准 MP4 + 原子落盘
  */
 object AppleDownloader {
 
@@ -45,7 +47,7 @@ object AppleDownloader {
     @Volatile
     var parallelChunks = 4
 
-    /** license 交换用哪条路：先 MediaDrm，失败自动回落内置 WVD 凭证。 */
+    /** license 交换用哪条路：优先内置 WVD（无需 MediaDrm streaming 限制），失败回落系统 MediaDrm。 */
     @Volatile
     var useBuiltinCdmFirst = true
 
@@ -55,10 +57,6 @@ object AppleDownloader {
 
     /**
      * 下载并解密一首歌。
-     *
-     * @param songId Apple Music 歌曲 ID
-     * @param isLibrary 是否资料库歌曲
-     * @param outPath 目标文件绝对路径
      */
     fun downloadSong(
         api: AppleApi,
@@ -68,8 +66,24 @@ object AppleDownloader {
         onProgress: ((Stage, Int, String) -> Unit)? = null
     ): Result {
         val res = Result()
-        val report: (Stage, Int, String) -> Unit = { s, p, n -> onProgress?.invoke(s, p, n) }
+        val lastPct = AtomicInteger(-1)
+        val report: (Stage, Int, String) -> Unit = { s, p, n ->
+            val clamped = p.coerceIn(0, 100)
+            if (s == Stage.FAILED || s == Stage.DONE) {
+                onProgress?.invoke(s, clamped, n)
+            } else {
+                // 保证同一首歌进度单调递增，避免 4 线程并发导致进度条倒退闪烁
+                var prev = lastPct.get()
+                while (clamped > prev && !lastPct.compareAndSet(prev, clamped)) {
+                    prev = lastPct.get()
+                }
+                if (clamped >= prev) {
+                    onProgress?.invoke(s, clamped, n)
+                }
+            }
+        }
         try {
+            checkNotInterrupted()
             // ① 拿播放资产
             report(Stage.RESOLVING, 2, "解析播放地址")
             val wb = api.getWebPlayback(songId, isLibrary)
@@ -77,40 +91,41 @@ object AppleDownloader {
             if (target == null || target.url.isEmpty()) {
                 throw RuntimeException("该歌曲没有可用的音频资源（可能需要订阅）")
             }
-            // webPlayback 返回的 songId 是 **catalog id**；license 交换必须用它。
             val catalogId = if (wb.songId.isNotEmpty()) wb.songId else songId
             Logx.i(TAG, "asset flavor=${target.flavor} libraryId=$songId catalogId=$catalogId")
 
+            checkNotInterrupted()
             // ② 子清单
             report(Stage.RESOLVING, 6, "解析音频清单")
             val subText = api.downloadText(target.url)
             val media = HlsParser.parseMedia(subText, target.url)
             if (media.keyUri.isEmpty()) throw RuntimeException("清单里没有密钥信息")
             Logx.i(
-                TAG, "子清单: method=${media.keyMethod} init=${media.initUri} segs=${media.segments.size} " +
-                        "kid=${com.applemusic.android.drm.Pssh.kidHex(media.keyUri)}"
+                TAG,
+                "子清单: method=${media.keyMethod} init=${media.initUri} segs=${media.segments.size} " +
+                    "kid=${com.applemusic.android.drm.Pssh.kidHex(media.keyUri)}"
             )
 
+            checkNotInterrupted()
             // ③ 取密钥
             report(Stage.LICENSING, 12, "获取解密密钥")
-            // 注意：/v1/play/assets 只认 **catalog id**，传资料库 id（i.xxx）会 400。
-            // 这里用 webPlayback 换回来的 catalogId，拿不到就退回官方固定端点。
             val licenseServer = runCatching { api.getPlayAssets(catalogId).keyServerUrl }.getOrDefault("")
             val key = fetchKey(api, catalogId, media.keyUri, licenseServer)
             res.keyHex = ByteOps.toHex(key)
             Logx.i(TAG, "content key = ${res.keyHex}")
 
+            checkNotInterrupted()
             // ④ 下载整段音频
             report(Stage.DOWNLOADING, 20, "下载音频数据")
             val mediaUrl = HlsParser.absolute(media.baseUrl, media.mediaUri)
             val totalLen = totalLength(media)
             val data = downloadMedia(api, mediaUrl, media, totalLen) { p ->
-                report(Stage.DOWNLOADING, 20 + (p * 0.45f).toInt(), "下载音频数据")
+                report(Stage.DOWNLOADING, 20 + (p * 45f).toInt(), "下载音频数据")
             }
 
+            checkNotInterrupted()
             // ⑤ 解密
             report(Stage.DECRYPTING, 65, "解密音频数据")
-            // 采样数据在 mdat 里、不在文件头 —— 所以按 moof 找到样本再抽样检查
             val probeBefore = probeFirstSample(data)
             val stats = CencDecryptor.decryptWholeFile(key, data)
             val probeAfter = probeFirstSample(data)
@@ -121,14 +136,15 @@ object AppleDownloader {
                 throw RuntimeException("没有解出任何音频数据（格式可能变了）")
             }
 
-            // ⑥ 写文件：清 DRM 残留 → 重封装成普通 MP4 → ftyp 归一化。
+            checkNotInterrupted()
+            // ⑥ 写文件：清 DRM 残留 → 重封装成普通 MP4 → ftyp 归一化 → 原子落盘
             report(Stage.WRITING, 85, "优化音频格式")
             val cleaned = Mp4Cleaner.stripDrmHeaders(data)
             report(Stage.WRITING, 92, "封装音频流")
             val remuxed = Mp4Remuxer.remux(cleaned)
             val final = remuxed ?: cleaned
             if (remuxed == null) {
-                Logx.w(TAG, "重封装未生效，仍写分片 MP4（时长/拖动可能异常）")
+                Logx.w(TAG, "重封装未生效，保留清理后的 fMP4")
             }
             report(Stage.WRITING, 96, "写入本地缓存")
             Mp4Cleaner.normalizeFtyp(final)
@@ -139,7 +155,7 @@ object AppleDownloader {
             res.filePath = outPath
             res.bytes = final.size
             res.message = "frags=${stats.fragments} samples=${stats.samples} decBytes=${stats.bytes} " +
-                    "key-source=$lastKeySource remux=${remuxed != null}"
+                "key-source=$lastKeySource remux=${remuxed != null}"
             report(Stage.DONE, 100, "完成")
             Logx.i(TAG, "已写出 $outPath (${final.size} bytes, remux=${remuxed != null})")
         } catch (e: Throwable) {
@@ -147,21 +163,26 @@ object AppleDownloader {
             res.ok = false
             res.message = msg
             report(Stage.FAILED, 0, msg)
-            Logx.e(TAG, "downloadSong failed: $msg", e)
+            if (e is InterruptedException) {
+                Thread.currentThread().interrupt()
+                Logx.i(TAG, "downloadSong cancelled: $songId")
+            } else {
+                Logx.e(TAG, "downloadSong failed: $msg", e)
+            }
             try {
-                File(outPath + ".part").delete()
+                File("$outPath.part").delete()
             } catch (_: Throwable) {
             }
         }
         return res
     }
 
-    /**
-     * 抽样检查第一个 moof 的第一个样本，用来判断「解密到底对不对」。
-     *
-     * AAC 的 raw_data_block 头 3 bit 是元素类型（0=单声道 SCE、1=双声道 CPE），
-     * 正常音频几乎总是 0 或 1。如果解密后这里明显不是 0/1，说明密钥/IV/偏移有错。
-     */
+    private fun checkNotInterrupted() {
+        if (Thread.currentThread().isInterrupted) {
+            throw InterruptedException("下载已取消")
+        }
+    }
+
     private fun probeFirstSample(data: ByteArray): String {
         return try {
             var off = 0
@@ -191,7 +212,6 @@ object AppleDownloader {
                 for (s in subs) sb.append("(clear=${s.clear},enc=${s.encrypted})")
             }
             sb.append(" dataOffset=").append(info.dataOffset)
-            // 头 8 字节
             if (info.dataOffset + 8 <= data.size) {
                 sb.append(" head=").append(ByteOps.toHex(data, info.dataOffset, 8))
                 val b0 = data[info.dataOffset].toInt() and 0xFF
@@ -204,25 +224,45 @@ object AppleDownloader {
     }
 
     /** 从 assets 里挑 256kbps 的 aac-web（28:ctrp256），退而求其次选任意 256 / 第一条。 */
-    fun pickAsset(assets: List<AppleAsset>): AppleAsset? {        if (assets.isEmpty()) return null
+    fun pickAsset(assets: List<AppleAsset>): AppleAsset? {
+        if (assets.isEmpty()) return null
         assets.firstOrNull { it.flavor.contains("ctrp256") }?.let { return it }
         assets.firstOrNull { it.flavor.contains("256") }?.let { return it }
         return assets[0]
     }
 
     /**
-     * 走 Widevine 取 content key：先试系统 MediaDrm，失败再回落内置 WVD 凭证。
-     *
-     * 两条路的协议完全一样（challenge → POST → license → 内容密钥），
-     * 差别只在「challenge 谁签、密钥谁保管」。
+     * 走 Widevine 取 content key：优先内置 WVD，失败再回落系统 MediaDrm。
+     * License POST 严格检查 HTTP 2xx，遇到 401 自动刷新开发者令牌并重试一次。
      */
     private fun fetchKey(api: AppleApi, catalogId: String, keyUri: String, licenseServer: String): ByteArray {
+        val targetUrl = licenseServer.ifEmpty { com.applemusic.android.drm.DEFAULT_LICENSE_SERVER }
         val post: (String) -> String = { body ->
-            val r = com.applemusic.android.net.Http.request(
-                licenseServer.ifEmpty { com.applemusic.android.drm.DEFAULT_LICENSE_SERVER },
-                "POST", api.licenseHeaders(), body.toByteArray(Charsets.UTF_8), 15000, 30000
+            api.ensureReady()
+            var r = Http.request(
+                url = targetUrl,
+                method = "POST",
+                headers = api.licenseHeaders(),
+                body = body.toByteArray(Charsets.UTF_8),
+                connectTimeoutMs = 15000,
+                readTimeoutMs = 30000
             )
+            if (r.code == 401) {
+                Logx.w(TAG, "license HTTP 401，刷新 developer token 后重试")
+                api.refreshDeveloperToken(force = true)
+                r = Http.request(
+                    url = targetUrl,
+                    method = "POST",
+                    headers = api.licenseHeaders(),
+                    body = body.toByteArray(Charsets.UTF_8),
+                    connectTimeoutMs = 15000,
+                    readTimeoutMs = 30000
+                )
+            }
             Logx.i(TAG, "license http=${r.code} len=${r.body.size}")
+            if (r.code !in 200..299) {
+                throw RuntimeException("License 服务器拒绝 (HTTP ${r.code}): ${r.text.take(120)}")
+            }
             r.text
         }
         val mediaDrm: KeyFetcher = MediaDrmKeyFetcher(post)
@@ -232,11 +272,13 @@ object AppleDownloader {
 
         var lastError: Throwable? = null
         for (f in order) {
+            checkNotInterrupted()
             try {
                 val key = f.fetchKey(keyUri, catalogId, licenseServer)
                 lastKeySource = f.name
                 return key
             } catch (t: Throwable) {
+                if (t is InterruptedException) throw t
                 lastError = t
                 Logx.w(TAG, "密钥获取失败（${f.name}）：${t.message}")
             }
@@ -254,13 +296,8 @@ object AppleDownloader {
         return max
     }
 
-    /**
-     * 校验 HLS 分片能否无缝铺满 [initEnd, totalLen)。
-     *
-     * 拼装式下载只有在分片**不重叠、不空洞、且用完整个文件**时才安全；
-     * 一旦清单格式有变，宁可回退整段单请求，也不能悄悄拼出一个打不开的文件。
-     */
     private fun rangesCover(init: HlsByteRange, segs: List<HlsByteRange>, totalLen: Int): Boolean {
+        if (totalLen <= 0) return false
         var expect = init.offset + init.length
         for (seg in segs) {
             if (seg.length <= 0) return false
@@ -271,8 +308,8 @@ object AppleDownloader {
     }
 
     /**
-     * 下载媒体：默认按 HLS 分片并发 Range 拉取并拼成整段；
-     * 分片信息不可用时回退成一次整段 GET。
+     * 下载媒体：按 HLS 分片并发 Range 拉取并严格校验字节完整性；
+     * 若 CDN 对 Range 返回完整 200 文件则直接复用，绝不产出零填充损坏音频。
      */
     private fun downloadMedia(
         api: AppleApi,
@@ -282,84 +319,152 @@ object AppleDownloader {
         onProgress: (Float) -> Unit
     ): ByteArray {
         val segs = media.segments
-        if (parallelChunks <= 1 || segs.size <= 1 || !rangesCover(media.initRange, segs, totalLen)) {
-            Logx.i(TAG, "downloadMedia: 分片不连续，回退整段单请求")
+        val distinctUris = segs.any { it.uri.isNotEmpty() && it.uri != media.mediaUri }
+        if (parallelChunks <= 1 || segs.size <= 1 || distinctUris || !rangesCover(media.initRange, segs, totalLen)) {
+            Logx.i(TAG, "downloadMedia: 回退整段单请求")
             onProgress(0.05f)
             val whole = api.downloadRange(url, -1, -1)
+            if (whole.isEmpty()) throw IOException("整段音频下载为空")
             onProgress(1f)
             return whole
         }
-        val buf = ByteArray(totalLen)
-        val counter = java.util.concurrent.atomic.AtomicInteger(0)
-        val done = java.util.concurrent.atomic.AtomicInteger(0)
 
-        // init segment（ftyp+moov）单独取一次，它不在分片列表里。
+        val buf = ByteArray(totalLen)
+        val counter = AtomicInteger(0)
+        val done = AtomicInteger(0)
+        val failed = AtomicBoolean(false)
+
+        // 先拉取 init segment
         val initLen = media.initRange.length
         if (initLen > 0) {
-            val head = api.downloadRange(url, media.initRange.offset, media.initRange.offset + initLen - 1)
-            val hn = minOf(head.size, initLen)
-            System.arraycopy(head, 0, buf, media.initRange.offset, hn)
-            done.addAndGet(hn)
+            checkNotInterrupted()
+            val initResp = Http.getRange(
+                url = url,
+                headers = api.mediaHeaders(),
+                rangeStart = media.initRange.offset,
+                rangeEnd = media.initRange.offset + initLen - 1,
+                readTimeoutMs = 60000
+            )
+            if (initResp.code == 200 && initResp.body.size == totalLen) {
+                // CDN 直接返回整首歌，无需再并发拉取分片
+                onProgress(1f)
+                return initResp.body
+            }
+            if (initResp.code != 206 || initResp.body.size != initLen) {
+                throw IOException("init 分片不完整: http=${initResp.code}, expected=$initLen, actual=${initResp.body.size}")
+            }
+            System.arraycopy(initResp.body, 0, buf, media.initRange.offset, initLen)
+            done.addAndGet(initLen)
+            onProgress(minOf(1f, done.get().toFloat() / totalLen))
         }
 
         val workers = minOf(parallelChunks, segs.size)
         val threads = ArrayList<Thread>(workers)
-        val errors = java.util.Collections.synchronizedList(ArrayList<Throwable>())
+        val errors = Collections.synchronizedList(ArrayList<Throwable>())
+        val fullFileResult = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
+
         for (w in 0 until workers) {
-            val t = Thread {
-                while (true) {
+            val t = Thread({
+                while (!failed.get() && !Thread.currentThread().isInterrupted && fullFileResult.get() == null) {
                     val i = counter.getAndIncrement()
                     if (i >= segs.size) return@Thread
                     val seg = segs[i]
                     try {
-                        val part = api.downloadRange(url, seg.offset, seg.offset + seg.length - 1)
-                        val n = minOf(part.size, seg.length)
-                        synchronized(buf) {
-                            System.arraycopy(part, 0, buf, seg.offset, n)
+                        val resp = Http.getRange(
+                            url = url,
+                            headers = api.mediaHeaders(),
+                            rangeStart = seg.offset,
+                            rangeEnd = seg.offset + seg.length - 1,
+                            readTimeoutMs = 60000
+                        )
+                        if (resp.code == 200 && resp.body.size == totalLen) {
+                            fullFileResult.compareAndSet(null, resp.body)
+                            return@Thread
                         }
-                        val d = done.addAndGet(n)
+                        if (resp.code != 206 || resp.body.size != seg.length) {
+                            throw IOException(
+                                "分片 #$i 不完整: http=${resp.code}, expected=${seg.length}, actual=${resp.body.size}"
+                            )
+                        }
+                        System.arraycopy(resp.body, 0, buf, seg.offset, seg.length)
+                        val d = done.addAndGet(seg.length)
                         onProgress(minOf(1f, d.toFloat() / totalLen))
                     } catch (t2: Throwable) {
-                        errors.add(t2)
+                        if (failed.compareAndSet(false, true)) {
+                            errors.add(t2)
+                            threads.forEach { other -> if (other !== Thread.currentThread()) other.interrupt() }
+                        }
                         return@Thread
                     }
                 }
-            }
+            }, "am-dl-$w")
             t.isDaemon = true
             threads.add(t)
-            t.start()
         }
-        for (t in threads) t.join(180_000)
+        threads.forEach { it.start() }
+
+        val deadline = System.currentTimeMillis() + 180_000L
+        try {
+            for (t in threads) {
+                val remain = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+                t.join(remain)
+            }
+        } catch (ie: InterruptedException) {
+            failed.set(true)
+            threads.forEach { it.interrupt() }
+            Thread.currentThread().interrupt()
+            throw ie
+        }
+
+        val stillAlive = threads.any { it.isAlive }
+        if (stillAlive) {
+            failed.set(true)
+            threads.forEach { it.interrupt() }
+            throw IOException("分片下载超时（超过 180 秒）")
+        }
+
+        fullFileResult.get()?.let { whole ->
+            onProgress(1f)
+            return whole
+        }
+
         if (errors.isNotEmpty()) {
             throw RuntimeException("分片下载失败：${errors[0].message}", errors[0])
+        }
+        if (done.get() != totalLen) {
+            throw IOException("音频下载不完整：expected=$totalLen, actual=${done.get()}")
         }
         return buf
     }
 
     /**
-     * 原子写入：先写 `<path>.part`，落盘后再改名到目标路径。
-     *
-     * 直接 TRUNC 写目标路径的话，一旦进程被杀/并发写，会在缓存路径上留下一个
-     * 半截的 m4a，而它会被当成有效缓存长期命中 —— 对应歌曲就再也播不出来。
+     * 原子写入：先写 `<path>.part` 并 fsync，再直接 renameTo 原子替换目标路径（绝不先 delete 目标）。
      */
     private fun writeFileAtomic(path: String, data: ByteArray) {
-        val tmp = File(path + ".part")
-        tmp.parentFile?.mkdirs()
+        val target = File(path)
+        target.parentFile?.mkdirs()
+        val tmp = File("$path.part")
         RandomAccessFile(tmp, "rw").use { raf ->
             raf.setLength(0)
             raf.write(data)
             try {
                 raf.fd.sync()
             } catch (_: Throwable) {
-                // 部分设备不支持 fsync，忽略
             }
         }
-        val target = File(path)
-        if (target.exists()) target.delete()
         if (!tmp.renameTo(target)) {
-            // 少数情况下 rename 失败（跨卷/占用），退回复制
-            tmp.copyTo(target, overwrite = true)
-            tmp.delete()
+            // 跨卷/极端情况退回复制，但失败时绝不留下半截目标文件
+            try {
+                tmp.copyTo(target, overwrite = true)
+            } catch (t: Throwable) {
+                try {
+                    target.delete()
+                } catch (_: Throwable) {
+                }
+                throw t
+            } finally {
+                tmp.delete()
+            }
         }
     }
 }

@@ -7,10 +7,8 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 极简日志 + 落盘日志。
- *
- * 对应鸿蒙版的 `AppleDiag`：真机排查时 logcat 会被刷掉，所以同时写一份到
- * `filesDir/diag.log`（超过 2MB 截断重来）。
+ * 线程安全的极简日志 + 落盘诊断日志。
+ * 同时写一份到 `filesDir/diag.log`（超过 2MB 截断重来）。
  */
 object Logx {
 
@@ -20,10 +18,19 @@ object Logx {
     @Volatile
     var logFile: File? = null
 
-    private val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    private val fileLock = Any()
+
+    private val fmtThreadLocal = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat =
+            SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    }
 
     fun init(filesDir: File) {
-        logFile = File(filesDir, "diag.log")
+        synchronized(fileLock) {
+            if (logFile == null) {
+                logFile = File(filesDir, "diag.log")
+            }
+        }
     }
 
     fun d(tag: String, msg: String) {
@@ -53,13 +60,16 @@ object Logx {
 
     private fun write(level: String, tag: String, msg: String) {
         val f = logFile ?: return
-        try {
-            if (f.exists() && f.length() > MAX_LOG_BYTES) {
-                f.delete()
+        val ts = fmtThreadLocal.get()?.format(Date()).orEmpty()
+        synchronized(fileLock) {
+            try {
+                if (f.exists() && f.length() > MAX_LOG_BYTES) {
+                    f.delete()
+                }
+                f.appendText("$ts $level/$tag $msg\n")
+            } catch (_: Throwable) {
+                // 日志本身不抛异常
             }
-            f.appendText("${fmt.format(Date())} $level/$tag $msg\n")
-        } catch (_: Throwable) {
-            // 日志本身不抛异常
         }
     }
 }

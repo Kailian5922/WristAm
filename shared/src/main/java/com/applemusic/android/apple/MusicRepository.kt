@@ -6,18 +6,22 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 资料库仓库：进程内的唯一数据源。
- *
- * 对应鸿蒙版里「MusicDatabase + LibrarySignal + 聚合重建」这一摊事的合并简化版：
- * 同步拿到 Apple 的数据 → 落 JSON 快照 → 在内存里算出
- * 歌曲 / 专辑 / 艺人 / 歌单 四个板块 + 播放队列映射。
+ * 资料库仓库：线程安全、单锁保护的进程内唯一数据源。
  */
 object MusicRepository {
 
     private const val TAG = "MusicRepository"
+    private const val MAX_TRANSIENT_SONGS = 600
+
+    private val initLock = Any()
+    private val dataLock = Any()
+    private val initialized = AtomicBoolean(false)
+    private val syncingFlag = AtomicBoolean(false)
 
     private lateinit var appContext: Context
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "repo-io").apply { isDaemon = true } }
@@ -27,10 +31,9 @@ object MusicRepository {
     lateinit var cache: AppleCache
         private set
 
-    /** 同步状态（UI 轮询/回调）。 */
-    @Volatile
-    var syncing = false
-        private set
+    fun isInitialized(): Boolean = initialized.get()
+
+    val syncing: Boolean get() = syncingFlag.get()
 
     @Volatile
     var syncNote = ""
@@ -44,16 +47,29 @@ object MusicRepository {
     var lastSyncAt = 0L
         private set
 
-    /** 原始数据。 */
+    /** 原始资料库数据（全部由 dataLock 统一保护）。 */
     private val songs = ArrayList<AppleLibrarySync.SongRow>()
     private val playlists = ArrayList<AppleLibrarySync.PlaylistRow>()
     private val playlistTracks = HashMap<String, List<String>>()
+    private val playlistSongRows = HashMap<String, AppleLibrarySync.SongRow>()
     private val avatars = HashMap<String, String>()
     private val songByUri = HashMap<String, AppleLibrarySync.SongRow>()
 
-    /** 聚合结果（供 UI 直接读）。 */
-    val albumList = ArrayList<AlbumAgg>()
-    val artistList = ArrayList<ArtistAgg>()
+    /** 有界 LRU 临时目录歌曲索引（避免长电台会话无限增长）。 */
+    private val transientSongs = object : LinkedHashMap<String, AppleLibrarySync.SongRow>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, AppleLibrarySync.SongRow>?): Boolean {
+            return size > MAX_TRANSIENT_SONGS
+        }
+    }
+
+    /** 聚合结果快照（只读拷贝供外部安全读取）。 */
+    @Volatile
+    var albumList: List<AlbumAgg> = emptyList()
+        private set
+
+    @Volatile
+    var artistList: List<ArtistAgg> = emptyList()
+        private set
 
     class AlbumAgg {
         var name = ""
@@ -72,56 +88,70 @@ object MusicRepository {
         var coverUrl = ""
     }
 
+    private val listeners = CopyOnWriteArraySet<() -> Unit>()
+
+    @Volatile
     var listener: (() -> Unit)? = null
 
+    fun addListener(l: () -> Unit) {
+        listeners.add(l)
+    }
+
+    fun removeListener(l: () -> Unit) {
+        listeners.remove(l)
+    }
+
+    /** 幂等、线程安全初始化（供 Application、Activity 及后台 Service 共享调用）。 */
     fun init(context: Context, tokenStore: TokenStore? = null) {
-        appContext = context.applicationContext
-        api = AppleApi(tokenStore ?: PrefTokenStore(appContext))
-        api.restore()
-        cache = AppleCache(appContext, api)
-        cache.init()
-        loadSnapshot()
+        if (initialized.get()) return
+        synchronized(initLock) {
+            if (initialized.get()) return
+            appContext = context.applicationContext
+            api = AppleApi(tokenStore ?: PrefTokenStore(appContext))
+            api.restore()
+            cache = AppleCache(appContext, api)
+            cache.init()
+            loadSnapshot()
+            initialized.set(true)
+        }
     }
 
     private fun snapshotFile(): File = File(appContext.filesDir, "library.json")
 
     private fun loadSnapshot() {
         val snap = AppleLibrarySync.load(snapshotFile()) ?: return
-        songs.clear()
-        songs.addAll(snap.songs)
-        playlists.clear()
-        playlists.addAll(snap.playlists)
-        playlistTracks.clear()
-        playlistTracks.putAll(snap.playlistTracks)
-        avatars.clear()
-        avatars.putAll(snap.avatars)
-        lastSyncAt = snap.syncedAt
-        rebuild()
+        synchronized(dataLock) {
+            songs.clear()
+            songs.addAll(snap.songs.filter { it.isLibrary })
+            playlists.clear()
+            playlists.addAll(snap.playlists)
+            playlistTracks.clear()
+            playlistTracks.putAll(snap.playlistTracks)
+            playlistSongRows.clear()
+            for (s in snap.songs) {
+                if (!s.isLibrary && s.uri.isNotEmpty()) {
+                    playlistSongRows[s.uri] = s
+                }
+            }
+            avatars.clear()
+            avatars.putAll(snap.avatars)
+            lastSyncAt = snap.syncedAt
+            rebuildLocked()
+        }
     }
 
-    fun songCount(): Int = songs.size
-    fun playlistCount(): Int = playlists.size
+    fun songCount(): Int = synchronized(dataLock) { songs.size }
+    fun playlistCount(): Int = synchronized(dataLock) { playlists.size }
 
-    fun allSongs(): List<AppleLibrarySync.SongRow> = songs
+    fun allSongs(): List<AppleLibrarySync.SongRow> = synchronized(dataLock) { songs.toList() }
 
-    fun songByUri(uri: String): AppleLibrarySync.SongRow? = songByUri[uri]
+    fun songByUri(uri: String): AppleLibrarySync.SongRow? = synchronized(dataLock) {
+        songByUri[uri] ?: playlistSongRows[uri] ?: transientSongs[uri]
+    }
 
-    /**
-     * 「临时目录歌曲」索引。
-     *
-     * 主页/新发现/广播 浏览到的专辑、歌单里的歌，**不一定在用户资料库里**。
-     * 而播放链路（`PlaybackEngine.prepareAndPlay` → `findSong`）原本只认资料库快照，
-     * 于是浏览页点歌会全部落到「这首歌不在本地资料库里」。
-     *
-     * 这里单独放一份内存索引：只用于解析播放，**不写进资料库快照**，
-     * 所以资料库列表不会被浏览到的歌污染。
-     */
-    private val transientSongs = HashMap<String, AppleLibrarySync.SongRow>()
-
-    /** 登记一批「只是浏览到、不在资料库」的目录歌曲，使其可被 [findSong] 解析并播放。 */
     fun registerTransient(rows: List<AppleLibrarySync.SongRow>) {
         if (rows.isEmpty()) return
-        synchronized(transientSongs) {
+        synchronized(dataLock) {
             for (r in rows) {
                 if (r.uri.isEmpty()) continue
                 transientSongs[r.uri] = r
@@ -129,91 +159,119 @@ object MusicRepository {
         }
     }
 
-    /**
-     * 查找一首歌：先按 uri（`apple:<id>`），再按裸 id 兜底。
-     * 队列里存的是 uri，但目录歌曲可能只记了 catalogId。
-     */
+    /** 按 uri 或裸 id（appleId / catalogId）查找歌曲（全锁保护，无竞态）。 */
     fun findSong(uriOrId: String): AppleLibrarySync.SongRow? {
-        songByUri[uriOrId]?.let { return it }
+        if (uriOrId.isEmpty()) return null
         val bare = uriOrId.removePrefix("apple:")
-        // ① 资料库
-        songs.firstOrNull { it.appleId == bare || it.catalogId == bare }?.let { return it }
-        // ② 浏览到的目录歌曲（不写进资料库快照）
-        synchronized(transientSongs) {
+        synchronized(dataLock) {
+            songByUri[uriOrId]?.let { return it }
+            songByUri["apple:$bare"]?.let { return it }
+            songs.firstOrNull { it.appleId == bare || it.catalogId == bare }?.let { return it }
+            playlistSongRows[uriOrId]?.let { return it }
+            playlistSongRows["apple:$bare"]?.let { return it }
+            playlistSongRows.values.firstOrNull { it.appleId == bare || it.catalogId == bare }?.let { return it }
             transientSongs[uriOrId]?.let { return it }
             transientSongs["apple:$bare"]?.let { return it }
             return transientSongs.values.firstOrNull { it.appleId == bare || it.catalogId == bare }
         }
     }
 
-    fun playlistById(id: String): AppleLibrarySync.PlaylistRow? = playlists.firstOrNull { it.id == id }
+    fun playlistById(id: String): AppleLibrarySync.PlaylistRow? =
+        synchronized(dataLock) { playlists.firstOrNull { it.id == id } }
 
-    /** 全部歌单（歌单页用）。 */
-    fun allPlaylists(): List<AppleLibrarySync.PlaylistRow> = playlists
+    fun allPlaylists(): List<AppleLibrarySync.PlaylistRow> =
+        synchronized(dataLock) { playlists.toList() }
 
-    /** 歌单曲目（uri 列表），未拉取过则返回本地已知的。 */
     fun playlistSongs(id: String): List<AppleLibrarySync.SongRow> {
-        val uris = playlistTracks[id] ?: return emptyList()
+        val uris = synchronized(dataLock) { playlistTracks[id]?.toList() } ?: return emptyList()
         return uris.mapNotNull { findSong(it) }
     }
 
-    fun hasPlaylistTracks(id: String): Boolean = playlistTracks.containsKey(id)
+    fun hasPlaylistTracks(id: String): Boolean =
+        synchronized(dataLock) { playlistTracks.containsKey(id) }
 
-    /** 把某个歌单的曲目拉下来并缓存（打开歌单时调用）。 */
+    /**
+     * 拉取歌单曲目并单独缓存于 [playlistSongRows]，绝不把非资料库曲目混入 [songs] 污染资料库/专辑/艺人。
+     */
     fun loadPlaylistTracks(id: String): List<AppleLibrarySync.SongRow> {
         val rows = AppleLibrarySync.loadPlaylistSongs(api, id)
         val uris = ArrayList<String>(rows.size)
-        synchronized(songs) {
+        synchronized(dataLock) {
             for (r in rows) {
                 uris.add(r.uri)
-                songByUri[r.uri] = r
-                if (songs.none { it.uri == r.uri }) songs.add(r)
+                if (!songByUri.containsKey(r.uri)) {
+                    playlistSongRows[r.uri] = r
+                }
             }
+            playlistTracks[id] = uris
+            persistLocked()
         }
-        playlistTracks[id] = uris
-        persist()
-        rebuild()
         notifyChanged()
         return rows
     }
 
-    /** 全量同步（歌曲 + 歌单元数据）。 */
+    /** 退出登录时彻底清空内存资料库与本地快照，杜绝切换账号串号。 */
+    fun clearForLogout() {
+        synchronized(dataLock) {
+            songs.clear()
+            playlists.clear()
+            playlistTracks.clear()
+            playlistSongRows.clear()
+            avatars.clear()
+            songByUri.clear()
+            transientSongs.clear()
+            albumList = emptyList()
+            artistList = emptyList()
+            lastSyncAt = 0L
+            syncNote = ""
+            syncPercent = 0
+            try {
+                if (::appContext.isInitialized) {
+                    snapshotFile().delete()
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        notifyChanged()
+    }
+
+    /** 全量同步（账号区服 + 资料库歌曲 + 艺人官方头像 + 歌单元数据）。 */
     fun syncAll(onDone: ((Boolean, String) -> Unit)? = null) {
-        if (syncing) return
-        syncing = true
+        if (!syncingFlag.compareAndSet(false, true)) {
+            onDone?.invoke(false, "正在同步中，请稍候")
+            return
+        }
         syncPercent = 0
         syncNote = "开始同步"
+        notifyChanged()
         io.execute {
             var ok = true
             var msg = ""
             try {
                 api.getAccountInfo()
-                val newSongs = AppleLibrarySync.fetchSongs(api) { p, n ->
-                    syncPercent = p
+                val (newSongs, newAvatars) = AppleLibrarySync.fetchSongsWithAvatars(api) { p, n ->
+                    syncPercent = (p * 0.85f).toInt()
                     syncNote = n
                 }
-                val probe = LinkedHashMap<String, String>()
-                for (s in newSongs) {
-                    if (s.catalogId.isNotEmpty() && s.artist.isNotEmpty() && !probe.containsKey(s.artist)) {
-                        probe[s.artist] = s.catalogId
-                    }
-                }
-                val newAvatars = AppleLibrarySync.fetchArtistAvatars(api, probe)
                 val newPlaylists = AppleLibrarySync.fetchPlaylists(api) { p, n ->
-                    syncPercent = minOf(99, p)
+                    syncPercent = minOf(99, 85 + (p * 0.14f).toInt())
                     syncNote = n
                 }
-                synchronized(songs) {
+                val validPlaylistIds = newPlaylists.mapTo(HashSet()) { it.id }
+                synchronized(dataLock) {
                     songs.clear()
                     songs.addAll(newSongs)
+                    playlists.clear()
+                    playlists.addAll(newPlaylists)
+                    // 清理已删除的歌单曲目缓存
+                    playlistTracks.keys.retainAll(validPlaylistIds)
+                    // 必须在 rebuildLocked() 之前更新 avatars，否则官方头像无法立刻生效
+                    avatars.clear()
+                    avatars.putAll(newAvatars)
+                    lastSyncAt = System.currentTimeMillis()
                     rebuildLocked()
+                    persistLocked()
                 }
-                playlists.clear()
-                playlists.addAll(newPlaylists)
-                avatars.clear()
-                avatars.putAll(newAvatars)
-                lastSyncAt = System.currentTimeMillis()
-                persist()
                 msg = "同步完成：${newSongs.size} 首 / ${newPlaylists.size} 个歌单"
                 Logx.i(TAG, msg)
             } catch (e: Throwable) {
@@ -221,8 +279,8 @@ object MusicRepository {
                 msg = e.message ?: e.toString()
                 Logx.e(TAG, "同步失败: $msg", e)
             } finally {
-                syncing = false
-                syncPercent = 100
+                syncingFlag.set(false)
+                syncPercent = if (ok) 100 else 0
                 syncNote = msg
                 notifyChanged()
                 onDone?.invoke(ok, msg)
@@ -230,49 +288,73 @@ object MusicRepository {
         }
     }
 
-    /** 搜索（目录侧）：歌曲 / 专辑 / 艺人 / 歌单。 */
     fun searchCatalog(term: String, limit: Int = 25): AppleSearchResult = api.search(term, limit)
 
-    /** 仅资料库本地过滤（零网络）。 */
     fun searchLocal(term: String): AppleSearchResult {
-        val t = term.lowercase()
+        val t = term.trim().lowercase(Locale.ROOT)
         val out = AppleSearchResult()
         if (t.isBlank()) return out
-        for (s in songs) {
-            if (s.title.lowercase().contains(t) || s.artist.lowercase().contains(t) ||
-                s.album.lowercase().contains(t)
+        val songsSnap: List<AppleLibrarySync.SongRow>
+        val albumsSnap: List<AlbumAgg>
+        val artistsSnap: List<ArtistAgg>
+        val playlistsSnap: List<AppleLibrarySync.PlaylistRow>
+        synchronized(dataLock) {
+            songsSnap = songs.toList()
+            albumsSnap = albumList
+            artistsSnap = artistList
+            playlistsSnap = playlists.toList()
+        }
+        for (s in songsSnap) {
+            if (s.title.lowercase(Locale.ROOT).contains(t) ||
+                s.artist.lowercase(Locale.ROOT).contains(t) ||
+                s.album.lowercase(Locale.ROOT).contains(t)
             ) {
                 out.songs.add(songFromRow(s))
             }
         }
-        for (a in albumList) {
-            if (a.name.lowercase().contains(t) || a.artist.lowercase().contains(t)) {
-                out.albums.add(AppleAlbum(name = a.name, artistName = a.artist, artworkUrl = a.coverUrl,
-                    trackCount = a.trackCount, year = a.year, isLibrary = true))
+        for (a in albumsSnap) {
+            if (a.name.lowercase(Locale.ROOT).contains(t) || a.artist.lowercase(Locale.ROOT).contains(t)) {
+                out.albums.add(
+                    AppleAlbum(
+                        name = a.name,
+                        artistName = a.artist,
+                        artworkUrl = a.coverUrl,
+                        trackCount = a.trackCount,
+                        year = a.year,
+                        isLibrary = true
+                    )
+                )
             }
         }
-        for (ar in artistList) {
-            if (ar.name.lowercase().contains(t)) {
-                out.artists.add(AppleArtist(name = ar.name, artworkUrl = ar.coverUrl,
-                    songCount = ar.songCount, albumCount = ar.albumCount))
+        for (ar in artistsSnap) {
+            if (ar.name.lowercase(Locale.ROOT).contains(t)) {
+                out.artists.add(
+                    AppleArtist(
+                        name = ar.name,
+                        artworkUrl = ar.coverUrl,
+                        songCount = ar.songCount,
+                        albumCount = ar.albumCount
+                    )
+                )
             }
         }
-        for (p in playlists) {
-            if (p.name.lowercase().contains(t)) {
-                out.playlists.add(ApplePlaylist(id = p.id, name = p.name, artworkUrl = p.coverUrl,
-                    trackCount = p.trackCount))
+        for (p in playlistsSnap) {
+            if (p.name.lowercase(Locale.ROOT).contains(t)) {
+                out.playlists.add(
+                    ApplePlaylist(
+                        id = p.id,
+                        name = p.name,
+                        artworkUrl = p.coverUrl,
+                        trackCount = p.trackCount
+                    )
+                )
             }
         }
         return out
     }
 
-    /** 用一列歌曲行当播放队列（uri 形式）。 */
     fun urisOf(rows: List<AppleLibrarySync.SongRow>): List<String> = rows.map { it.uri }
 
-    /**
-     * 同步后曲目 id 可能变化 → 修队列，避免播放条指向不存在的曲目。
-     * （对应原版的 remapQueueAfterSync，这里队列很短，直接滤掉失效项。）
-     */
     fun remapQueue(uris: List<String>): List<String> {
         val out = ArrayList<String>(uris.size)
         for (u in uris) {
@@ -283,17 +365,22 @@ object MusicRepository {
     }
 
     fun songsOfAlbum(name: String, artist: String): List<AppleLibrarySync.SongRow> {
-        return albumList.firstOrNull { it.name == name && it.artist == artist }?.songs ?: emptyList()
+        return albumList.firstOrNull { it.name == name && it.artist == artist }?.songs?.toList() ?: emptyList()
     }
 
-    fun songsOfArtist(name: String): List<AppleLibrarySync.SongRow> =
-        songs.filter { it.artist == name }.sortedWith(
-            compareBy({ it.album }, { it.discNumber }, { it.trackNumber })
-        )
+    /** 查找资料库中该艺人的曲目（同时匹配单艺人及合作曲目）。 */
+    fun songsOfArtist(name: String): List<AppleLibrarySync.SongRow> {
+        val target = name.trim()
+        if (target.isEmpty()) return emptyList()
+        return synchronized(dataLock) {
+            songs.filter { row ->
+                row.artist.equals(target, ignoreCase = true) ||
+                    row.artist.contains(target, ignoreCase = true)
+            }.sortedWith(compareBy({ it.album }, { it.discNumber }, { it.trackNumber }))
+        }
+    }
 
-    // ─────────────────────── 内部 ───────────────────────
-
-    private fun persist() {
+    private fun persistLocked() {
         val snap = AppleLibrarySync.Snapshot()
         snap.songs = ArrayList(songs)
         snap.playlists = ArrayList(playlists)
@@ -303,10 +390,6 @@ object MusicRepository {
         AppleLibrarySync.save(snapshotFile(), snap)
     }
 
-    @Synchronized
-    private fun rebuild() = rebuildLocked()
-
-    /** 重建专辑/艺人聚合（对应原版的 rebuildAggregates）。 */
     private fun rebuildLocked() {
         songByUri.clear()
         val albumMap = LinkedHashMap<String, AlbumAgg>()
@@ -346,29 +429,31 @@ object MusicRepository {
         for (agg in albumMap.values) {
             agg.trackCount = agg.songs.size
             agg.songs.sortWith(compareBy({ it.discNumber }, { it.trackNumber }))
-            val ar = artistMap[agg.artist]
-            if (ar != null) ar.albumCount++
+            artistMap[agg.artist]?.let { it.albumCount++ }
         }
         for ((name, votes) in genreVotes) {
             val top = votes.maxByOrNull { it.value }?.key ?: ""
             artistMap[name]?.genre = top
         }
-        // 头像缺失时用某首歌的封面兜底
         for (ar in artistMap.values) {
             if (ar.coverUrl.isEmpty()) {
                 ar.coverUrl = songs.firstOrNull { it.artist == ar.name }?.coverUrl ?: ""
             }
         }
 
-        albumList.clear()
-        albumList.addAll(albumMap.values.sortedBy { it.name.lowercase() })
-        artistList.clear()
-        artistList.addAll(artistMap.values.sortedBy { it.name.lowercase() })
+        albumList = albumMap.values.sortedBy { it.name.lowercase(Locale.ROOT) }
+        artistList = artistMap.values.sortedBy { it.name.lowercase(Locale.ROOT) }
         Logx.i(TAG, "聚合完成：${songs.size} 首 / ${albumList.size} 张专辑 / ${artistList.size} 位艺人")
     }
 
     fun notifyChanged() {
         listener?.invoke()
+        for (l in listeners) {
+            try {
+                l()
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun syncTimeText(): String {
@@ -378,19 +463,24 @@ object MusicRepository {
     }
 
     private fun songFromRow(s: AppleLibrarySync.SongRow): AppleSong = AppleSong(
-        id = s.appleId, name = s.title, artistName = s.artist, albumName = s.album,
-        durationMs = s.durationMs, trackNumber = s.trackNumber, discNumber = s.discNumber,
-        year = s.year, artworkUrl = s.coverUrl, isLibrary = s.isLibrary, genre = s.genre,
+        id = s.appleId,
+        name = s.title,
+        artistName = s.artist,
+        albumName = s.album,
+        isrc = s.isrc,
+        artistId = s.artistId,
+        durationMs = s.durationMs,
+        trackNumber = s.trackNumber,
+        discNumber = s.discNumber,
+        year = s.year,
+        artworkUrl = s.coverUrl,
+        isLibrary = s.isLibrary,
+        genre = s.genre,
         catalogId = s.catalogId
     )
 
-    /** 把 AppleSong（目录搜索结果）转成可入库的行。 */
     fun rowOf(s: AppleSong): AppleLibrarySync.SongRow = AppleLibrarySync.toRow(s)
 
-    /**
-     * 用一个货架卡片（歌曲类型）临时造一条可播放的记录。
-     * 主页/新发现里偶尔直接给歌曲卡片，那种情况下没有完整的 AppleSong 字段。
-     */
     fun transientRow(
         catalogId: String,
         title: String,

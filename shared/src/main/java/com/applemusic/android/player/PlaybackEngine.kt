@@ -1,45 +1,105 @@
 package com.applemusic.android.player
 
+import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import androidx.core.content.ContextCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionToken
 import com.applemusic.android.apple.AppleCache
-import com.applemusic.android.apple.AppleDownloader
 import com.applemusic.android.apple.AppleLibrarySync
 import com.applemusic.android.apple.MusicRepository
 import com.applemusic.android.util.Logx
-import java.io.File
+import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 播放引擎。
- *
- * 对应鸿蒙版 `MediaService` 的「点 PlaybackHelper → MediaService.loadAsset」这一层：
- * 队列里存的是 `apple:<id>` 这样的 uri，播放前确保本地已有解密好的文件
- * （没有就先走 AppleDownloader 的六步流水线），然后交给 ExoPlayer 播本地 m4a。
- *
- * 之所以不用 ExoPlayer 的原生 DRM 直接播 HLS：Apple 的 license 端点需要
- * `adamId`/`uri`/`key-system` 这一套自定义 JSON 体，和 ExoPlayer 的
- * DrmSessionManager 默认请求格式对不上，反而更绕。
+ * 播放引擎（单例）：
+ * - 单通道可取消准备线程池（快速连切秒取消旧下载，杜绝手表 OOM）
+ * - ExoPlayer WakeMode + 后台准备期定时 Partial WakeLock（灭屏切歌不中断）
+ * - 响应式 [stateFlow] + 多订阅者监听（Activity 重建不丢监听）
+ * - 后台线程异步持久化队列快照（消除主线程 5s 周期 JSON 序列化卡顿）
  */
 object PlaybackEngine {
 
     private const val TAG = "PlaybackEngine"
     const val ACTION_OPEN_NOW_PLAYING = "com.applemusic.android.action.OPEN_NOW_PLAYING"
+    private const val QUEUE_LOW_WATER = 4
+    private const val PLAYBACK_PREFERENCES = "playback_state"
+    private const val PLAYBACK_STATE_KEY = "queue_snapshot"
+    private const val PERSIST_INTERVAL_MS = 5_000L
+    private const val MAX_PERSISTED_WINDOW = 60
 
+    data class Snapshot(
+        val queue: List<String> = emptyList(),
+        val queueIndex: Int = -1,
+        val playingIndex: Int = -1,
+        val currentSong: AppleLibrarySync.SongRow? = null,
+        val targetSong: AppleLibrarySync.SongRow? = null,
+        val isPlaying: Boolean = false,
+        val playbackState: Int = Player.STATE_IDLE,
+        val preparing: Boolean = false,
+        val preparingNote: String = "",
+        val durationMs: Long = 0L,
+        val seekRevision: Long = 0L,
+        val revision: Long = 0L
+    )
+
+    @Volatile
     var player: ExoPlayer? = null
         private set
 
     private val main = Handler(Looper.getMainLooper())
+    private val prepareExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "audio-prepare").apply { isDaemon = true }
+    }
+    private val maintenanceExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "playback-maint").apply { isDaemon = true }
+    }
+
+    @Volatile
+    private var activePrepareFuture: Future<*>? = null
+
+    @Volatile
     private var appContext: Context? = null
+
+    @Volatile
     private var restorePositionMs = 0L
+
+    @Volatile
     private var restorePlayWhenReady = false
+
+    @Volatile
     private var pendingPlaybackRestore = false
+
+    private val playGeneration = AtomicLong(0L)
+    private val seekCounter = AtomicLong(0L)
+    private val stateRevision = AtomicLong(0L)
+
     private val persistSnapshotRunnable = object : Runnable {
         override fun run() {
             persistQueueState()
@@ -47,10 +107,8 @@ object PlaybackEngine {
         }
     }
 
-    /** 队列（uri 形式）。 */
     private val queue = ArrayList<String>()
 
-    /** 用户选中 / 正在准备的那一首。 */
     @Volatile
     var queueIndex = -1
         private set
@@ -58,13 +116,6 @@ object PlaybackEngine {
     @Volatile
     private var skipPendingForQueueContinuation = false
 
-    /**
-     * **真正在出声**的那一首。
-     *
-     * 界面（标题、封面、歌词）一律以它为准，而不是 [queueIndex]。
-     * 这样「点了新歌但下载失败」时，界面会停留在上一首 + 一条错误提示，
-     * 不会出现「歌名是新歌、声音是旧歌」这种对不上的情况。
-     */
     @Volatile
     private var playingIndex = -1
 
@@ -75,143 +126,144 @@ object PlaybackEngine {
     @Volatile
     var preparingNote = ""
 
-    /** 状态变化回调（主线程）。 */
-    var onStateChanged: (() -> Unit)? = null
+    private val badUris = HashSet<String>()
 
+    @Volatile
     private var lastIoRetryUri: String? = null
 
-    /**
-     * 队列快见底或用户手动切歌时的回调（智能电台用来「续杯」）。
-     * 普通列表播放时把它置为 null 即可。
-     */
+    private val _stateFlow = MutableStateFlow(Snapshot())
+    val stateFlow: StateFlow<Snapshot> = _stateFlow.asStateFlow()
+
+    private val stateListeners = CopyOnWriteArraySet<() -> Unit>()
+
+    @Volatile
+    var onStateChanged: (() -> Unit)? = null
+
+    @Volatile
     var onQueueLow: ((remaining: Int) -> Unit)? = null
 
-    /** Called instead of wrapping to the first item when the current queue ends. */
+    @Volatile
     var onQueueEnded: (() -> Boolean)? = null
 
-    /** 水位：剩这么几首就提前去要下一批，避免播到断流。 */
-    private val QUEUE_LOW_WATER = 4
-    private const val PLAYBACK_PREFERENCES = "playback_state"
-    private const val PLAYBACK_STATE_KEY = "queue_snapshot"
-    private const val PERSIST_INTERVAL_MS = 5_000L
+    @Volatile
+    var onPrefetchLyrics: ((String) -> Unit)? = null
 
-    /**
-     * 往队列**末尾**追加曲目（已有曲目不会重复添加）。
-     *
-     * 追加不会移动已有下标，所以 [playingIndex] / [queueIndex] 依然有效 ——
-     * 这正是「无限电台」能边放边续的关键。
-     */
-    fun appendToQueue(uris: List<String>): Int {
-        if (uris.isEmpty()) return 0
-        var added = 0
-        synchronized(queue) {
-            val existing = HashSet(queue)
-            for (u in uris) {
-                if (u.isEmpty() || !existing.add(u)) continue
-                queue.add(u)
-                added++
+    private var mediaSession: MediaSession? = null
+    private var selfControllerFuture: ListenableFuture<MediaController>? = null
+    private var selfController: MediaController? = null
+    private var mediaSessionServiceClass: Class<out MediaSessionService>? = null
+
+    fun addStateListener(listener: () -> Unit) {
+        stateListeners.add(listener)
+    }
+
+    fun removeStateListener(listener: () -> Unit) {
+        stateListeners.remove(listener)
+    }
+
+    fun session(): MediaSession? = mediaSession
+
+    private fun dispatchStateChanged() {
+        val emit = Runnable {
+            val snap = buildSnapshot()
+            _stateFlow.value = snap
+            try {
+                onStateChanged?.invoke()
+            } catch (_: Throwable) {
             }
-        }
-        if (added > 0) {
-            persistQueueState()
-            Logx.i(TAG, "队列续杯 +$added 首（现共 ${synchronized(queue) { queue.size }} 首）")
-            onStateChanged?.invoke()
-            val pendingIndex = synchronized(queue) {
-                if (skipPendingForQueueContinuation) {
-                    skipPendingForQueueContinuation = false
-                    maxOf(queueIndex, playingIndex) + 1
-                } else {
-                    -1
+            for (l in stateListeners) {
+                try {
+                    l()
+                } catch (_: Throwable) {
                 }
             }
-            if (pendingIndex >= 0 && pendingIndex < synchronized(queue) { queue.size }) {
-                playAt(pendingIndex)
-            }
         }
-        return added
-    }
-
-    /** 剩余待播曲目数。 */
-    fun queueRemaining(): Int = synchronized(queue) { queue.size - queueIndex - 1 }
-
-    /** 水位检查：剩得不多就通知外部补货。 */
-    private fun notifyIfQueueLow() {
-        val cb = onQueueLow ?: return
-        val remaining = queueRemaining()
-        if (remaining <= QUEUE_LOW_WATER) {
-            Logx.i(TAG, "队列只剩 $remaining 首，请求续杯")
-            cb(remaining)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            emit.run()
+        } else {
+            main.post(emit)
         }
     }
 
-    /**
-     * 系统媒体会话。
-     *
-     * 【为什么必须有】只调 ExoPlayer 的话，**安卓系统媒体控制完全不知道本应用在放歌**：
-     * 通知栏 / 锁屏 / 蓝牙耳机都不显示、媒体按键也送不到这里。
-     * 真机上表现为「系统播放器管理里根本没有我们在放歌」。
-     *
-     * 挂上 [androidx.media3.session.MediaSession] 之后，系统才知道，
-     * 并且 `KEYCODE_MEDIA_NEXT` / `KEYCODE_MEDIA_PREVIOUS` 等按键才会路由到本应用。
-     */
-    private var mediaSession: androidx.media3.session.MediaSession? = null
-
-    /** 本应用自己连到自身会话的控制器（用来促使系统投递媒体通知）。 */
-    private var selfController: androidx.media3.session.MediaController? = null
-
-    private var mediaSessionServiceClass:
-        Class<out androidx.media3.session.MediaSessionService>? = null
-
-    /**
-     * 把会话交给 [MusicService]（系统通过它来投递媒体通知、提升前台服务）。
-     *
-     * 只注册 `MediaSession` 而没有 `MediaSessionService` 时，系统**不会主动**
-     * 为本应用发媒体通知，通知栏/锁屏/音量面板都不会出现媒体卡片。
-     */
-    fun session(): androidx.media3.session.MediaSession? = mediaSession
+    private fun buildSnapshot(): Snapshot {
+        val qCopy: List<String>
+        val qIdx: Int
+        val pIdx: Int
+        val playingUri: String?
+        val targetUri: String?
+        synchronized(queue) {
+            qCopy = ArrayList(queue)
+            qIdx = queueIndex
+            pIdx = playingIndex
+            playingUri = queue.getOrNull(pIdx)
+            targetUri = queue.getOrNull(qIdx)
+        }
+        val curSong = playingUri?.let { MusicRepository.findSong(it) }
+            ?: targetUri?.let { MusicRepository.findSong(it) }
+        val tgtSong = targetUri?.let { MusicRepository.findSong(it) }
+        val p = player
+        val exoDur = p?.duration?.takeIf { it > 0L } ?: 0L
+        val dur = if (exoDur > 0L) exoDur else (curSong?.durationMs ?: 0L)
+        return Snapshot(
+            queue = qCopy,
+            queueIndex = qIdx,
+            playingIndex = pIdx,
+            currentSong = curSong,
+            targetSong = tgtSong,
+            isPlaying = p?.isPlaying == true,
+            playbackState = p?.playbackState ?: Player.STATE_IDLE,
+            preparing = preparing,
+            preparingNote = preparingNote,
+            durationMs = dur,
+            seekRevision = seekCounter.get(),
+            revision = stateRevision.incrementAndGet()
+        )
+    }
 
     fun init(
         context: Context,
-        serviceClass: Class<out androidx.media3.session.MediaSessionService>? = null
+        serviceClass: Class<out MediaSessionService>? = null
     ) {
-        if (player != null) return
         appContext = context.applicationContext
-        mediaSessionServiceClass = serviceClass ?: try {
-            @Suppress("UNCHECKED_CAST")
-            Class.forName("com.applemusic.lyricstool.wear.WearMusicService") as Class<out androidx.media3.session.MediaSessionService>
-        } catch (_: Throwable) {
-            MusicService::class.java
+        if (serviceClass != null) {
+            mediaSessionServiceClass = serviceClass
+        } else if (mediaSessionServiceClass == null) {
+            mediaSessionServiceClass = try {
+                @Suppress("UNCHECKED_CAST")
+                Class.forName("com.applemusic.lyricstool.wear.WearMusicService") as Class<out MediaSessionService>
+            } catch (_: Throwable) {
+                MusicService::class.java
+            }
         }
-        val p = ExoPlayer.Builder(context.applicationContext).build()
+        if (player != null) {
+            dispatchStateChanged()
+            return
+        }
 
-        // ═══════════════ 音频焦点（必须） ═══════════════
-        //
-        // ExoPlayer 只有在设置 AudioAttributes 并启用音频焦点处理后才会申请焦点。
-        //   1. 别的 app 在放歌时我们照放，两路声音打架；
-        //   2. 系统不认为我们是「当前媒体播放器」，
-        //      音量面板 / 媒体卡片显示的是**别的 app**（真机上看到的是 com.luna.music）；
-        //   3. 别的 app 抢焦点时我们不会自动暂停。
+        val p = ExoPlayer.Builder(context.applicationContext).build()
         p.setAudioAttributes(
-            androidx.media3.common.AudioAttributes.Builder()
-                .setUsage(androidx.media3.common.C.USAGE_MEDIA)
-                .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+            AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                 .build(),
             /* handleAudioFocus = */ true
         )
-        // 拔耳机 / 断开蓝牙时自动暂停（否则会突然外放）
         p.setHandleAudioBecomingNoisy(true)
+        // 灭屏播放保活，避免 Wear OS Doze 中断音频解码
+        p.setWakeMode(C.WAKE_MODE_LOCAL)
 
         p.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 Logx.i(TAG, "playbackState=$playbackState (1=IDLE 2=BUFFERING 3=READY 4=ENDED)")
                 if (playbackState == Player.STATE_READY) {
                     preparingNote = ""
+                    lastIoRetryUri = null
                 }
                 if (playbackState == Player.STATE_ENDED) {
                     next()
                 }
                 persistQueueState()
-                onStateChanged?.invoke()
+                dispatchStateChanged()
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -221,12 +273,10 @@ object PlaybackEngine {
                 if (isPlaying) {
                     main.postDelayed(persistSnapshotRunnable, PERSIST_INTERVAL_MS)
                 }
-                onStateChanged?.invoke()
+                dispatchStateChanged()
             }
 
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                // 【重要】播放器解不开文件时，必须把**完整异常链**写出来，
-                // 否则只知道最外层的错误码，定位不到「到底在读文件的哪个位置越界」。
+            override fun onPlayerError(error: PlaybackException) {
                 Logx.e(TAG, "播放器错误：${error.errorCodeName} ${error.message}", error)
                 var cause: Throwable? = error.cause
                 var depth = 0
@@ -235,140 +285,118 @@ object PlaybackEngine {
                     cause = cause.cause
                     depth++
                 }
-                Logx.e(
-                    TAG,
-                    "  上下文：uri=${currentUri()} title=${currentSong()?.title ?: "?"} " +
-                            "duration=${player?.duration} position=${player?.currentPosition}"
-                )
                 val curUri = currentUri()
-                if (error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
+                val expectedGen = playGeneration.get()
+                val expectedIndex = playingIndex
+                if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
                     error.errorCodeName.contains("IO")
                 ) {
                     if (curUri != null && lastIoRetryUri != curUri) {
                         lastIoRetryUri = curUri
-                        Logx.w(TAG, "检测到IO文件错误，清理失效缓存并重新加载：$curUri")
+                        Logx.w(TAG, "检测到 IO 文件错误，后台清理失效缓存后重载：$curUri")
                         val cleanId = curUri.removePrefix("apple:")
-                        MusicRepository.cache.invalidate(cleanId)
-                        main.postDelayed({
-                            prepareAndPlay(curUri, resumePositionMs = 0L, playWhenReady = true)
-                        }, 500L)
+                        maintenanceExecutor.execute {
+                            try {
+                                MusicRepository.cache.invalidate(cleanId, includePinned = false)
+                            } catch (_: Throwable) {
+                            }
+                            main.postDelayed({
+                                if (playGeneration.get() == expectedGen && currentUri() == curUri) {
+                                    queueIndex = expectedIndex.coerceAtLeast(0)
+                                    prepareAndPlay(curUri, resumePositionMs = 0L, playWhenReady = true)
+                                }
+                            }, 500L)
+                        }
                         return
                     }
                 }
                 preparing = false
                 preparingNote = "播放失败：${error.errorCodeName}"
-                onStateChanged?.invoke()
+                dispatchStateChanged()
             }
 
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
-                onStateChanged?.invoke()
+                dispatchStateChanged()
             }
         })
         player = p
         restoreQueueState()
         Logx.i(TAG, "ExoPlayer 已初始化")
         registerMediaSession(context.applicationContext, p)
+        dispatchStateChanged()
     }
 
-    /**
-     * 把播放器注册进系统媒体会话。
-     *
-     * 这样通知栏 / 锁屏 / 蓝牙耳机才知道「本应用正在放歌」，媒体按键也才会送过来。
-     */
     private fun registerMediaSession(ctx: Context, p: Player) {
         if (mediaSession != null) return
         try {
+            val builder = MediaSession.Builder(ctx, RadioPlayer(p))
             val appIntent = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
-                ?: android.content.Intent(ctx, MusicService::class.java)
-            appIntent.action = ACTION_OPEN_NOW_PLAYING
-            appIntent.addFlags(
-                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                    android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
-            )
-            val openApp = android.app.PendingIntent.getActivity(
-                ctx,
-                0,
-                appIntent,
-                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
-            )
-            mediaSession = androidx.media3.session.MediaSession.Builder(ctx, RadioPlayer(p))
-                .setSessionActivity(openApp)
-                .build()
-            Logx.i(TAG, "MediaSession 已注册：通知栏/锁屏/蓝牙媒体按键现在能识别本应用")
+            if (appIntent != null) {
+                appIntent.action = ACTION_OPEN_NOW_PLAYING
+                appIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                val openApp = PendingIntent.getActivity(
+                    ctx,
+                    0,
+                    appIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                builder.setSessionActivity(openApp)
+            }
+            mediaSession = builder.build()
+            Logx.i(TAG, "MediaSession 已注册")
             connectSelfController(ctx)
         } catch (t: Throwable) {
-            // 注册失败不该影响播放本身
             Logx.w(TAG, "MediaSession 注册失败：${t.message}")
         }
     }
 
-    /**
-     * 自己连一个 [androidx.media3.session.MediaController] 到自己的会话。
-     *
-     * ## 为什么必须这么做
-     *
-     * media3 的 `MediaSessionService` **只有在「有控制器连上」时才会去管理媒体通知**。
-     * 没连上时它既不会创建通知渠道、也不会发通知 ——
-     * 真机表现就是 Honor 控制中心/通知栏的媒体卡片一直显示「**未在播放**」，
-     * 尽管音频确实在响、音频焦点也确实在本应用手上（`dumpsys notification` 里
-     * 本应用**一个 NotificationChannel 都没有**，就是"从未尝试发通知"的铁证）。
-     *
-     * 而系统侧又是因为「没有通知」才不来连 —— 典型的鸡生蛋。
-     * 自己连一个控制器就能打破这个死循环，之后 SystemUI 才会接手。
-     */
     private fun connectSelfController(ctx: Context) {
-        val s = mediaSession ?: return
-        if (selfController != null) return
+        if (mediaSession == null || selfControllerFuture != null) return
         try {
-            // 【关键】token 必须指向 **MusicService**，不能用 mediaSession.token。
-            //
-            // 用 mediaSession.token 时，MediaController 会**直接连到会话本身**
-            // （同进程直连），**绕过 MediaSessionService** —— 服务那边
-            // `onGetSession` 根本不会被调用（真机日志验证过：服务已创建，
-            // 但 onGetSession 一次都没打印），于是 media3 永远不建通知。
-            //
-            // 用服务的 ComponentName 构造 token，连接才会走服务，
-            // 服务才会 onGetSession → 挂上会话 → 建立通知管理器 → 投递媒体通知。
             val targetService = mediaSessionServiceClass ?: MusicService::class.java
-            val token = androidx.media3.session.SessionToken(
-                ctx,
-                android.content.ComponentName(ctx, targetService)
-            )
-            val future = androidx.media3.session.MediaController.Builder(ctx, token).buildAsync()
+            val token = SessionToken(ctx, ComponentName(ctx, targetService))
+            val future = MediaController.Builder(ctx, token).buildAsync()
+            selfControllerFuture = future
             future.addListener(
                 {
                     try {
                         selfController = future.get()
-                        Logx.i(TAG, "已连接自身 MediaController（经服务）—— 系统现在会投递媒体通知")
+                        Logx.i(TAG, "已连接自身 MediaController（经 ${targetService.simpleName}）")
                     } catch (t: Throwable) {
                         Logx.w(TAG, "自身 MediaController 连接失败：${t.message}")
                     }
                 },
-                androidx.core.content.ContextCompat.getMainExecutor(ctx)
+                ContextCompat.getMainExecutor(ctx)
             )
         } catch (t: Throwable) {
             Logx.w(TAG, "构造自身 MediaController 失败：${t.message}")
         }
     }
 
-    /**
-     * 把播放器包一层，**对外声明「上一首 / 下一首可用」**。
-     *
-     * 【为什么需要】队列是我们自己管的，ExoPlayer 里永远只有「当前这一首」，
-     * 于是 `COMMAND_SEEK_TO_NEXT_MEDIA_ITEM` 被判为**不可用** ——
-     * 系统媒体按键（耳机 / 锁屏 / 通知栏）发过来会被 MediaSession **直接忽略**，
-     * 表现为「按键完全没反应」。
-     *
-     * 这里把这两个命令显式标成可用，并把实际动作接到 [next] / [prev]。
-     */
-    private class RadioPlayer(player: Player) :
-        androidx.media3.common.ForwardingPlayer(player) {
+    /** 服务准备 stopSelf 前先解绑 selfController，消除自绑定泄漏。 */
+    fun releaseSelfController() {
+        val future = selfControllerFuture
+        selfControllerFuture = null
+        if (future != null) {
+            try {
+                MediaController.releaseFuture(future)
+            } catch (_: Throwable) {
+            }
+        }
+        try {
+            selfController?.release()
+        } catch (_: Throwable) {
+        }
+        selfController = null
+    }
 
+    private class RadioPlayer(player: Player) : ForwardingPlayer(player) {
         private val extra = intArrayOf(
             Player.COMMAND_SEEK_TO_NEXT,
             Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
             Player.COMMAND_SEEK_TO_PREVIOUS,
-            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
+            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+            Player.COMMAND_PLAY_PAUSE
         )
 
         override fun getAvailableCommands(): Player.Commands {
@@ -385,6 +413,17 @@ object PlaybackEngine {
         override fun hasNextMediaItem(): Boolean = true
         override fun hasPreviousMediaItem(): Boolean = true
 
+        override fun play() {
+            val p = wrappedPlayer
+            if (pendingPlaybackRestore || p.mediaItemCount == 0 || p.playbackState == Player.STATE_IDLE ||
+                p.playbackState == Player.STATE_ENDED
+            ) {
+                PlaybackEngine.playOrResume()
+            } else {
+                super.play()
+            }
+        }
+
         override fun seekToNext() {
             Logx.i(TAG, "媒体按键：下一首")
             PlaybackEngine.next()
@@ -400,22 +439,84 @@ object PlaybackEngine {
         override fun seekToPreviousMediaItem() = seekToPrevious()
     }
 
-    fun currentUri(): String? = queue.getOrNull(playingIndex)
+    fun appendToQueue(uris: List<String>): Int {
+        if (uris.isEmpty()) return 0
+        var added = 0
+        var pendingIndex = -1
+        var totalSize = 0
+        synchronized(queue) {
+            val existing = HashSet(queue)
+            for (u in uris) {
+                if (u.isEmpty() || !existing.add(u)) continue
+                queue.add(u)
+                added++
+            }
+            totalSize = queue.size
+            if (added > 0 && skipPendingForQueueContinuation) {
+                skipPendingForQueueContinuation = false
+                val cursor = if (queueIndex >= 0) queueIndex else playingIndex
+                val candidate = cursor + 1
+                if (candidate in 0 until totalSize) {
+                    pendingIndex = candidate
+                }
+            }
+        }
+        if (added > 0) {
+            persistQueueState()
+            Logx.i(TAG, "队列续杯 +$added 首（现共 $totalSize 首）")
+            dispatchStateChanged()
+            if (pendingIndex >= 0) {
+                playAt(pendingIndex)
+            }
+        }
+        return added
+    }
+
+    /** 通知引擎电台续杯失败或暂时无新曲，避免永久卡在等待续歌状态。 */
+    fun onQueueContinuationFailed(reason: String) {
+        val wasPending = synchronized(queue) {
+            val v = skipPendingForQueueContinuation
+            skipPendingForQueueContinuation = false
+            v
+        }
+        if (wasPending) {
+            preparing = false
+            preparingNote = reason
+            dispatchStateChanged()
+        }
+    }
+
+    fun queueRemaining(): Int = synchronized(queue) {
+        val cursor = if (queueIndex >= 0) queueIndex else playingIndex
+        (queue.size - cursor - 1).coerceAtLeast(0)
+    }
+
+    private fun notifyIfQueueLow() {
+        val cb = onQueueLow ?: return
+        val remaining = queueRemaining()
+        if (remaining <= QUEUE_LOW_WATER) {
+            Logx.i(TAG, "队列只剩 $remaining 首，请求续杯")
+            cb(remaining)
+        }
+    }
+
+    fun currentUri(): String? = synchronized(queue) {
+        queue.getOrNull(playingIndex) ?: queue.getOrNull(queueIndex)
+    }
 
     fun currentSong(): AppleLibrarySync.SongRow? = currentUri()?.let { MusicRepository.findSong(it) }
 
-    /** 队列只读快照，供播放页展示；复制后不会暴露播放器内部列表。 */
+    fun targetUri(): String? = synchronized(queue) { queue.getOrNull(queueIndex) }
+
+    fun targetSong(): AppleLibrarySync.SongRow? = targetUri()?.let { MusicRepository.findSong(it) }
+
     fun queueSnapshot(): List<String> = synchronized(queue) { ArrayList(queue) }
 
-    /** 当前实际播放位置；首次播放尚未提交时回退到用户刚选中的位置。 */
-    fun currentQueueIndex(): Int {
-        val size = synchronized(queue) { queue.size }
-        return if (playingIndex in 0 until size) playingIndex else queueIndex
+    fun currentQueueIndex(): Int = synchronized(queue) {
+        if (playingIndex in 0 until queue.size) playingIndex else queueIndex
     }
 
-    fun isPlaying(): Boolean {
-        return player?.isPlaying == true
-    }
+    fun isPlaying(): Boolean = player?.isPlaying == true
 
     fun resumeRestoredPlayback() {
         if (!pendingPlaybackRestore) return
@@ -429,54 +530,94 @@ object PlaybackEngine {
         restorePlayWhenReady = false
         player?.pause()
         persistQueueState()
-        onStateChanged?.invoke()
+        dispatchStateChanged()
     }
 
-    private val playGeneration = java.util.concurrent.atomic.AtomicLong(0L)
-
-    /** 用一列 uri 播放下标 index 的歌。 */
-    fun playQueue(uris: List<String>, index: Int) {
+    /** 退出账号时彻底停止播放并清理队列与持久化快照。 */
+    fun stopAndClearForLogout() {
+        playGeneration.incrementAndGet()
+        activePrepareFuture?.cancel(true)
+        activePrepareFuture = null
+        main.removeCallbacks(persistSnapshotRunnable)
         synchronized(queue) {
             queue.clear()
-            queue.addAll(uris)
+            queueIndex = -1
+            playingIndex = -1
             skipPendingForQueueContinuation = false
         }
-        // 换了队列，旧的「正在出声的那首」下标已经无意义；
-        // 坏条目记录也一并清掉（换个上下文可能就好了，例如网络恢复）
-        playingIndex = -1
         synchronized(badUris) { badUris.clear() }
-        // 换队列时立即停止上一个音频并清空播放项，避免旧歌在后台一直播放
+        pendingPlaybackRestore = false
+        restorePositionMs = 0L
+        restorePlayWhenReady = false
+        preparing = false
+        preparingNote = ""
+        lastIoRetryUri = null
+        onQueueLow = null
+        onQueueEnded = null
         player?.let { p ->
             p.stop()
             p.clearMediaItems()
         }
-        playAt(index)
+        appContext?.getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
+            ?.edit()?.remove(PLAYBACK_STATE_KEY)?.apply()
+        dispatchStateChanged()
+    }
+
+    /** 用一列 uri 播放下标 index 的歌。 */
+    fun playQueue(uris: List<String>, index: Int) {
+        // 先推进代际并取消在途准备任务，防止旧队列异步任务覆盖新队列
+        playGeneration.incrementAndGet()
+        activePrepareFuture?.cancel(true)
+        activePrepareFuture = null
+
+        val safeIndex = if (uris.isEmpty()) -1 else index.coerceIn(0, uris.lastIndex)
+        synchronized(queue) {
+            queue.clear()
+            queue.addAll(uris)
+            queueIndex = safeIndex
+            playingIndex = -1
+            skipPendingForQueueContinuation = false
+        }
+        pendingPlaybackRestore = false
+        restorePositionMs = 0L
+        restorePlayWhenReady = false
+        preparing = false
+        preparingNote = ""
+        lastIoRetryUri = null
+        synchronized(badUris) { badUris.clear() }
+
+        player?.let { p ->
+            p.stop()
+            p.clearMediaItems()
+        }
+        if (safeIndex < 0) {
+            persistQueueState()
+            dispatchStateChanged()
+            return
+        }
+        playAt(safeIndex)
     }
 
     fun playSingle(uri: String) = playQueue(listOf(uri), 0)
 
-    /** 播放队列里的第 index 首（会先确保本地文件就绪）。 */
+    /** 播放队列里的第 index 首（清理所有挂起恢复/续杯标志）。 */
     fun playAt(index: Int) {
-        val uri = synchronized(queue) { queue.getOrNull(index) } ?: return
-        queueIndex = index
-        // 切歌时立即暂停旧音频，给出明确声学反馈，避免两首歌声音重叠
+        val uri = synchronized(queue) {
+            val u = queue.getOrNull(index) ?: return
+            queueIndex = index
+            skipPendingForQueueContinuation = false
+            u
+        }
+        pendingPlaybackRestore = false
+        restorePositionMs = 0L
+        restorePlayWhenReady = false
+
         player?.pause()
         persistQueueState()
-        onStateChanged?.invoke()
-        // 准备阶段就去检查水位：一首歌要下载十几秒，提前续杯能让切换无缝
+        dispatchStateChanged()
         notifyIfQueueLow()
         prepareAndPlay(uri)
     }
-
-    /**
-     * 播放失败过的 uri。
-     *
-     * 【为什么需要】失败时 [failPlayback] 会把 `queueIndex` 回退到「真正在播的那首」，
-     * 于是再点「下一首」还是同一个坏条目 —— 表现就是**一直重复同一首、永远跳不过去**
-     * （真机上踩到过：队列里混进一个专辑 id，next 就卡死在它上面）。
-     * 记住这些 uri，[next] / [prev] 会跳过。
-     */
-    private val badUris = HashSet<String>()
 
     private fun markBad(uri: String?) {
         if (uri.isNullOrEmpty()) return
@@ -488,8 +629,18 @@ object PlaybackEngine {
         return synchronized(badUris) { badUris.contains(uri) }
     }
 
-    /** 跳过坏条目往后找一首；找不到就返回起点（避免死循环）。 */
-    private fun findPlayable(from: Int, step: Int, n: Int): Int {
+    /** 仅严格向后扫描可播曲目（不回绕），找不到返回 -1。 */
+    private fun findPlayableForward(from: Int, n: Int): Int {
+        for (idx in (from + 1) until n) {
+            val u = synchronized(queue) { queue.getOrNull(idx) }
+            if (!isBad(u)) return idx
+        }
+        return -1
+    }
+
+    /** 环形查找可播曲目，全部为坏条目时返回 -1。 */
+    private fun findPlayableWrapped(from: Int, step: Int, n: Int): Int {
+        if (n <= 0) return -1
         var idx = ((from + step) % n + n) % n
         var guard = 0
         while (guard < n) {
@@ -498,128 +649,180 @@ object PlaybackEngine {
             idx = ((idx + step) % n + n) % n
             guard++
         }
-        return from
+        return -1
     }
 
     fun next() {
         val n = synchronized(queue) { queue.size }
         if (n == 0) return
-        val currentIndex = maxOf(queueIndex, playingIndex)
-        if (currentIndex + 1 < n) {
-            playAt(findPlayable(currentIndex, 1, n))
+        val cursor = if (queueIndex >= 0) queueIndex else playingIndex
+        val forward = findPlayableForward(cursor, n)
+        if (forward >= 0) {
+            playAt(forward)
             val continuation = onQueueLow
             if (continuation != null) {
                 val remaining = queueRemaining()
-                if (remaining > QUEUE_LOW_WATER) {
-                    Logx.i(TAG, "手动切歌后主动请求电台续歌（剩余 $remaining 首）")
+                if (remaining <= QUEUE_LOW_WATER + 2) {
                     continuation(remaining)
                 }
             }
             return
         }
+        // 后方已无可用曲目，先交给电台/外部续杯回调处理
         if (onQueueEnded?.invoke() == true) return
         val continuation = onQueueLow
         if (continuation != null) {
             synchronized(queue) { skipPendingForQueueContinuation = true }
             Logx.i(TAG, "电台队列暂无下一首，等待 Apple 续歌后跳转")
             continuation(0)
-            onStateChanged?.invoke()
+            dispatchStateChanged()
             return
         }
-        playAt(findPlayable(currentIndex, 1, n))
+        // 非电台模式：单曲播完直接停止不死循环；多曲列表回绕到首首可播曲
+        if (n == 1 && player?.playbackState == Player.STATE_ENDED) {
+            dispatchStateChanged()
+            return
+        }
+        val wrapped = findPlayableWrapped(cursor, 1, n)
+        if (wrapped >= 0) {
+            playAt(wrapped)
+        } else {
+            preparing = false
+            preparingNote = "队列中没有可播放的歌曲"
+            dispatchStateChanged()
+        }
     }
 
     fun prev() {
         val n = synchronized(queue) { queue.size }
         if (n == 0) return
-        playAt(findPlayable(maxOf(queueIndex, playingIndex), -1, n))
+        val cursor = if (queueIndex >= 0) queueIndex else playingIndex
+        val target = findPlayableWrapped(cursor, -1, n)
+        if (target >= 0) {
+            playAt(target)
+        }
+    }
+
+    fun playOrResume() {
+        if (player == null) {
+            appContext?.let { init(it, mediaSessionServiceClass) }
+        }
+        val p = player ?: return
+        val queueSize = synchronized(queue) { queue.size }
+        if (queueSize == 0) return
+
+        val needsPrepare = pendingPlaybackRestore ||
+            p.mediaItemCount == 0 ||
+            (p.playbackState == Player.STATE_IDLE && playingIndex != queueIndex)
+        if (needsPrepare) {
+            val idx = when {
+                queueIndex in 0 until queueSize -> queueIndex
+                playingIndex in 0 until queueSize -> playingIndex
+                else -> 0
+            }
+            val uri = synchronized(queue) { queue.getOrNull(idx) } ?: return
+            val resumePos = if (pendingPlaybackRestore) restorePositionMs else 0L
+            pendingPlaybackRestore = false
+            restorePlayWhenReady = true
+            synchronized(queue) { queueIndex = idx }
+            prepareAndPlay(uri, resumePos, playWhenReady = true)
+            return
+        }
+
+        when (p.playbackState) {
+            Player.STATE_IDLE -> {
+                p.prepare()
+                p.play()
+            }
+            Player.STATE_ENDED -> {
+                p.seekTo(0L)
+                p.play()
+            }
+            else -> p.play()
+        }
+        persistQueueState()
+        dispatchStateChanged()
     }
 
     fun toggle() {
-        val queueSize = synchronized(queue) { queue.size }
-        if (pendingPlaybackRestore || (player?.mediaItemCount ?: 0) == 0) {
-            val idx = if (queueIndex in 0 until queueSize) queueIndex
-            else if (playingIndex in 0 until queueSize) playingIndex
-            else 0
-            val uri = synchronized(queue) { queue.getOrNull(idx) }
-            if (uri != null) {
-                pendingPlaybackRestore = false
-                restorePlayWhenReady = true
-                queueIndex = idx
-                prepareAndPlay(uri, restorePositionMs, playWhenReady = true)
-                return
-            }
+        val p = player
+        if (p != null && p.isPlaying) {
+            p.pause()
+            persistQueueState()
+            dispatchStateChanged()
+        } else {
+            playOrResume()
         }
-        val p = player ?: return
-        if (p.isPlaying) p.pause() else p.play()
-        persistQueueState()
-        onStateChanged?.invoke()
     }
 
     fun seekTo(ms: Long) {
-        val p = player
-        val before = positionMs()
-        val dur = p?.duration ?: -1L
-        Logx.i(
-            TAG,
-            "seekTo($ms) 之前 pos=$before duration=$dur " +
-                    "seekable=${p?.isCurrentMediaItemSeekable}"
-        )
-        p?.seekTo(ms)
+        val targetMs = ms.coerceAtLeast(0L)
+        if (pendingPlaybackRestore) {
+            restorePositionMs = targetMs
+            seekCounter.incrementAndGet()
+            persistQueueState()
+            dispatchStateChanged()
+            return
+        }
+        val p = player ?: return
+        p.seekTo(targetMs)
+        seekCounter.incrementAndGet()
         persistQueueState()
-        Logx.i(TAG, "seekTo 之后 requested=$ms actual=${p?.currentPosition} state=${p?.playbackState}")
-        onStateChanged?.invoke()
+        dispatchStateChanged()
     }
 
-    fun positionMs(): Long = player?.currentPosition ?: 0
+    fun positionMs(): Long {
+        if (pendingPlaybackRestore && restorePositionMs > 0L) return restorePositionMs
+        return player?.currentPosition?.coerceAtLeast(0L) ?: 0L
+    }
 
     fun durationMs(): Long {
-        val d = player?.duration ?: 0
-        if (d > 0) return d
-        return currentSong()?.durationMs ?: 0
+        val d = player?.duration ?: 0L
+        if (d > 0L) return d
+        return currentSong()?.durationMs ?: 0L
     }
 
-    /**
-     * 确保本地文件就绪后播放。
-     *
-     * 注意：下载 + 解密必须在后台线程（一首歌几秒到几十秒），
-     * 而且同一首歌并发调用由 AppleCache 的 single-flight 兜住。
-     */
     private fun prepareAndPlay(
         uri: String,
         resumePositionMs: Long = 0L,
         playWhenReady: Boolean = true
     ) {
+        if (player == null) {
+            appContext?.let { init(it, mediaSessionServiceClass) }
+        }
         val currentGen = playGeneration.incrementAndGet()
+        activePrepareFuture?.cancel(true)
+
         Logx.i(TAG, "prepareAndPlay [gen=$currentGen] 收到 uri=$uri")
         val song = MusicRepository.findSong(uri)
         if (song == null) {
             Logx.w(TAG, "找不到这首歌：$uri（本地库 ${MusicRepository.songCount()} 首）")
-            preparingNote = "找不到这首歌（$uri）"
+            preparingNote = "找不到这首歌"
             preparing = false
-            onStateChanged?.invoke()
+            dispatchStateChanged()
             return
         }
         val rawId = if (song.appleId.isNotEmpty()) song.appleId else uri.removePrefix("apple:")
-        Logx.i(TAG, "song=${song.title} appleId=$rawId isLibrary=${song.isLibrary}")
-        // 记下「用户想播的是队列里第几首」。真正提交要等文件就绪、开始出声之后。
         val wantIndex = queueIndex
         preparing = true
         preparingNote = "准备中…"
-        onStateChanged?.invoke()
+        dispatchStateChanged()
 
-        Thread({
+        activePrepareFuture = prepareExecutor.submit {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            // 灭屏切换下一首时短暂持有 Partial WakeLock，避免 Doze 挂起解密下载线程
+            val wakeLock = acquireTempWakeLock()
             try {
+                if (currentGen != playGeneration.get() || Thread.currentThread().isInterrupted) return@submit
                 val path = MusicRepository.cache.ensure(
-                    rawId,
-                    song.isLibrary,
-                    onProgress = { stage, percent, note ->
+                    songId = rawId,
+                    isLibrary = song.isLibrary,
+                    onProgress = { _, percent, note ->
                         if (currentGen != playGeneration.get()) return@ensure
-                        preparingNote = "$note $percent%"
                         main.post {
                             if (currentGen == playGeneration.get()) {
-                                onStateChanged?.invoke()
+                                preparingNote = "$note $percent%"
+                                dispatchStateChanged()
                             }
                         }
                     },
@@ -629,9 +832,9 @@ object PlaybackEngine {
                         album = song.album
                     )
                 )
-                if (currentGen != playGeneration.get()) {
-                    Logx.i(TAG, "gen=$currentGen 已被新请求覆盖，丢弃就绪结果: $path")
-                    return@Thread
+                if (currentGen != playGeneration.get() || Thread.currentThread().isInterrupted) {
+                    Logx.i(TAG, "gen=$currentGen 已被新请求覆盖，丢弃就绪结果")
+                    return@submit
                 }
                 Logx.i(TAG, "缓存就绪：$path")
                 main.post {
@@ -639,25 +842,26 @@ object PlaybackEngine {
                     preparing = false
                     try {
                         val local = File(path)
-                        if (!local.exists() || local.length() < AppleCacheMin) {
+                        if (!local.exists() || local.length() < AppleCache.MIN_VALID_BYTES) {
                             failPlayback(wantIndex, "缓存文件异常（${local.length()}B）")
                             return@post
+                        }
+                        if (player == null) {
+                            appContext?.let { init(it, mediaSessionServiceClass) }
                         }
                         val p = player
                         if (p == null) {
                             failPlayback(wantIndex, "播放器未初始化")
-                            Logx.e(TAG, "player == null，PlaybackEngine.init 可能没执行")
                             return@post
                         }
-                        val fileUri = android.net.Uri.fromFile(local)
-                        Logx.i(TAG, "交给 ExoPlayer：$fileUri size=${local.length()}")
+                        val fileUri = Uri.fromFile(local)
                         val md = MediaMetadata.Builder()
                             .setTitle(song.title)
                             .setArtist(song.artist)
                             .setAlbumTitle(song.album)
                             .apply {
                                 if (song.coverUrl.isNotEmpty()) {
-                                    setArtworkUri(android.net.Uri.parse(song.coverUrl))
+                                    setArtworkUri(Uri.parse(song.coverUrl))
                                 }
                             }
                             .build()
@@ -667,17 +871,14 @@ object PlaybackEngine {
                         p.prepare()
                         if (resumePositionMs > 0L) p.seekTo(resumePositionMs)
                         p.playWhenReady = playWhenReady
-                        playingIndex = wantIndex
+                        synchronized(queue) {
+                            playingIndex = wantIndex
+                        }
                         restorePlayWhenReady = false
                         restorePositionMs = 0L
-                        persistQueueState()
                         preparingNote = ""
-                        Logx.i(
-                            TAG,
-                            "已调用 play()，playerState=${p.playbackState} isPlaying=${p.isPlaying} " +
-                                    "playingIndex=$playingIndex"
-                        )
-                        onStateChanged?.invoke()
+                        persistQueueState()
+                        dispatchStateChanged()
                         prefetchNextSongInQueue(wantIndex)
                     } catch (t: Throwable) {
                         Logx.e(TAG, "启动播放失败：${t.message}", t)
@@ -685,24 +886,40 @@ object PlaybackEngine {
                     }
                 }
             } catch (e: Throwable) {
-                if (currentGen != playGeneration.get()) return@Thread
+                if (e is InterruptedException || currentGen != playGeneration.get()) {
+                    Logx.i(TAG, "gen=$currentGen 准备任务已取消")
+                    return@submit
+                }
                 Logx.e(TAG, "准备失败 $rawId: ${e.message}", e)
                 main.post {
                     if (currentGen != playGeneration.get()) return@post
                     failPlayback(wantIndex, e.message ?: "准备失败")
                 }
+            } finally {
+                releaseTempWakeLock(wakeLock)
             }
-        }, "audio-prepare").start()
+        }
     }
 
-    /** 预取下一首歌词监听回调。 */
-    var onPrefetchLyrics: ((String) -> Unit)? = null
+    private fun acquireTempWakeLock(): PowerManager.WakeLock? {
+        return try {
+            val pm = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return null
+            pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WristAm:AudioPrepare").apply {
+                setReferenceCounted(false)
+                acquire(90_000L)
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
-    /**
-     * 智能缓存滑动窗口：
-     * 保留当前播放队列中前后 15 首歌（以及正在播放、正在准备的曲目），
-     * 避免频繁删除导致重新下载触发 ERROR_CODE_IO_FILE_NOT_FOUND。
-     */
+    private fun releaseTempWakeLock(wl: PowerManager.WakeLock?) {
+        try {
+            if (wl?.isHeld == true) wl.release()
+        } catch (_: Throwable) {
+        }
+    }
+
     fun pruneCacheAround(index: Int) {
         val allowedIds = HashSet<String>()
         synchronized(queue) {
@@ -723,69 +940,47 @@ object PlaybackEngine {
             song?.catalogId?.takeIf { it.isNotEmpty() }?.let { allowedIds.add(it) }
         }
         if (allowedIds.isEmpty()) return
-        Thread({
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        maintenanceExecutor.execute {
             try {
                 MusicRepository.cache.retainOnly(allowedIds)
             } catch (e: Throwable) {
                 Logx.w(TAG, "清理多余缓存异常: ${e.message}")
             }
-        }, "cache-pruner").start()
+        }
     }
 
-    /**
-     * 智能预加载下一首歌曲的音频与解密缓存 + 预解析歌词。
-     * 当当前歌曲开始播放时在后台静默拉取下一首，使用户切歌时 0 延迟秒开。
-     */
     private fun prefetchNextSongInQueue(currentIndex: Int) {
+        // 即使当前是队列最后一首，也要修剪窗口外旧临时缓存
+        pruneCacheAround(currentIndex)
+
         val nextUri = synchronized(queue) {
             val nextIndex = currentIndex + 1
             if (nextIndex in 0 until queue.size) queue[nextIndex] else null
         } ?: return
 
-        pruneCacheAround(currentIndex)
-
-        val rawId = nextUri.removePrefix("apple:")
-        val isLibrary = !rawId.matches(Regex("^[0-9]+$"))
         val song = MusicRepository.findSong(nextUri)
+        val rawId = song?.appleId?.takeIf { it.isNotEmpty() } ?: nextUri.removePrefix("apple:")
+        val isLibrary = song?.isLibrary ?: rawId.startsWith("i.")
         val metadata = song?.let {
-            AppleCache.SongMetadata(
-                title = it.title,
-                artist = it.artist,
-                album = it.album
-            )
+            AppleCache.SongMetadata(title = it.title, artist = it.artist, album = it.album)
         }
         Logx.i(TAG, "正在后台预加载下一首: $nextUri (${song?.title ?: ""})")
         onPrefetchLyrics?.invoke(nextUri)
         MusicRepository.cache.preload(rawId, isLibrary, metadata)
     }
 
-    /**
-     * 播放失败时的收尾。
-     *
-     * **不能让界面继续显示一首其实没在播的歌**：把当前曲目回退到「真正在出声的那首」，
-     * 并把失败原因留在 [preparingNote]（界面会以副标题形式显示）。
-     * 这样「歌名」和「声音」永远是一致的 —— 宁可显示上一首 + 一条错误提示，
-     * 也不能显示新歌名却放着上一首的音频。
-     */
     private fun failPlayback(wantIndex: Int, reason: String) {
         preparing = false
         preparingNote = "无法播放：$reason"
-        // 把这一条标记为坏，next/prev 会跳过它 —— 否则「下一首」会一直卡在同一首上
-        markBad(synchronized(queue) { queue.getOrNull(wantIndex) })
-        if (playingIndex >= 0) {
-            queueIndex = playingIndex
-        } else {
-            queueIndex = wantIndex
+        val badUri = synchronized(queue) { queue.getOrNull(wantIndex) }
+        markBad(badUri)
+        synchronized(queue) {
+            queueIndex = if (playingIndex >= 0) playingIndex else wantIndex
         }
         player?.stop()
-        Logx.w(
-            TAG,
-            "播放失败，当前曲目回退到 index=$queueIndex，已标记坏条目" +
-                    "（原因：$reason）"
-        )
+        Logx.w(TAG, "播放失败，当前曲目回退到 index=$queueIndex（原因：$reason）")
         persistQueueState()
-        onStateChanged?.invoke()
+        dispatchStateChanged()
     }
 
     private fun restoreQueueState() {
@@ -806,72 +1001,99 @@ object PlaybackEngine {
             }
             if (uris.isEmpty()) return
 
-            MusicRepository.registerTransient(rows)
-            synchronized(queue) {
-                queue.clear()
-                queue.addAll(uris)
+            if (MusicRepository.isInitialized()) {
+                MusicRepository.registerTransient(rows)
             }
             val selectedIndex = snapshot.optInt("queueIndex", -1).coerceIn(0, uris.lastIndex)
             val restoredPlayingIndex = snapshot.optInt("playingIndex", selectedIndex)
                 .takeIf { it in uris.indices } ?: selectedIndex
-            queueIndex = selectedIndex
-            playingIndex = restoredPlayingIndex
+            synchronized(queue) {
+                queue.clear()
+                queue.addAll(uris)
+                queueIndex = selectedIndex
+                playingIndex = restoredPlayingIndex
+            }
             restorePositionMs = snapshot.optLong("positionMs", 0L).coerceAtLeast(0L)
             restorePlayWhenReady = false
             pendingPlaybackRestore = true
-            persistQueueState()
-            Logx.i(TAG, "恢复播放队列 ${uris.size} 首，当前位置=$selectedIndex；重新进入时保持暂停")
+            Logx.i(TAG, "恢复播放队列 ${uris.size} 首，当前位置=$selectedIndex")
         } catch (error: Exception) {
             Logx.e(TAG, "恢复播放队列失败：${error.message}", error)
         }
     }
 
+    /** 仅在主线程抓轻量变量，序列化与落盘全部卸载到后台单线程执行器（零主线程卡顿）。 */
     private fun persistQueueState() {
         val context = appContext ?: return
-        val uris = synchronized(queue) { queue.toList() }
-        val preferences = context.getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
-        if (uris.isEmpty()) {
-            preferences.edit().remove(PLAYBACK_STATE_KEY).apply()
-            return
+        val urisSnap: List<String>
+        val qIdx: Int
+        val pIdx: Int
+        synchronized(queue) {
+            urisSnap = ArrayList(queue)
+            qIdx = queueIndex
+            pIdx = playingIndex
         }
-
-        val items = JSONArray()
-        for (uri in uris) {
-            val entry = JSONObject().put("uri", uri)
-            MusicRepository.findSong(uri)?.let { entry.put("song", it.toJson()) }
-            items.put(entry)
-        }
-        val currentPosition = if (restorePositionMs > 0L) {
+        val currentPosition = if (pendingPlaybackRestore && restorePositionMs > 0L) {
             restorePositionMs
         } else {
             player?.currentPosition?.coerceAtLeast(0L) ?: 0L
         }
-        val snapshot = JSONObject()
-            .put("items", items)
-            .put("queueIndex", queueIndex)
-            .put("playingIndex", playingIndex)
-            .put("positionMs", currentPosition)
-            .put("isPlaying", player?.playWhenReady ?: restorePlayWhenReady)
-        preferences.edit().putString(PLAYBACK_STATE_KEY, snapshot.toString()).apply()
+        val playing = player?.playWhenReady ?: restorePlayWhenReady
+
+        maintenanceExecutor.execute {
+            try {
+                val preferences = context.getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
+                if (urisSnap.isEmpty()) {
+                    preferences.edit().remove(PLAYBACK_STATE_KEY).apply()
+                    return@execute
+                }
+                // 裁剪超长电台队列窗口，防止 SharedPreferences JSON 无限膨胀
+                val anchor = if (pIdx in urisSnap.indices) pIdx else qIdx.coerceIn(0, urisSnap.lastIndex)
+                val start = (anchor - MAX_PERSISTED_WINDOW / 2).coerceAtLeast(0)
+                val end = (start + MAX_PERSISTED_WINDOW).coerceAtMost(urisSnap.size)
+                val sliced = urisSnap.subList(start, end)
+                val adjQ = (qIdx - start).coerceIn(0, sliced.lastIndex)
+                val adjP = (pIdx - start).coerceIn(0, sliced.lastIndex)
+
+                val items = JSONArray()
+                for (uri in sliced) {
+                    val entry = JSONObject().put("uri", uri)
+                    if (MusicRepository.isInitialized()) {
+                        MusicRepository.findSong(uri)?.let { entry.put("song", it.toJson()) }
+                    }
+                    items.put(entry)
+                }
+                val snapshot = JSONObject()
+                    .put("items", items)
+                    .put("queueIndex", adjQ)
+                    .put("playingIndex", adjP)
+                    .put("positionMs", currentPosition)
+                    .put("isPlaying", playing)
+                preferences.edit().putString(PLAYBACK_STATE_KEY, snapshot.toString()).apply()
+            } catch (t: Throwable) {
+                Logx.w(TAG, "持久化播放队列失败: ${t.message}")
+            }
+        }
     }
 
-    private const val AppleCacheMin = 1L
-
     fun release() {
+        playGeneration.incrementAndGet()
+        activePrepareFuture?.cancel(true)
+        activePrepareFuture = null
+        preparing = false
         main.removeCallbacks(persistSnapshotRunnable)
         persistQueueState()
-        // 先释放会话再释放播放器：顺序反了会在系统侧留下一个指向已释放播放器的会话
-        try {
-            selfController?.release()
-        } catch (_: Throwable) {
-        }
-        selfController = null
+        releaseSelfController()
         try {
             mediaSession?.release()
         } catch (_: Throwable) {
         }
         mediaSession = null
-        player?.release()
+        try {
+            player?.release()
+        } catch (_: Throwable) {
+        }
         player = null
+        dispatchStateChanged()
     }
 }

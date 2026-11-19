@@ -85,13 +85,17 @@ class PbReader(private val data: ByteArray) {
         when (f.wireType) {
             0 -> f.varint = readVarint()
             2 -> {
-                val len = readVarint().toInt()
-                val end = minOf(pos + len, data.size)
+                val rawLen = readVarint()
+                if (rawLen < 0L || rawLen > (data.size - pos).toLong()) {
+                    pos = data.size
+                    return null
+                }
+                val end = pos + rawLen.toInt()
                 f.bytes = data.copyOfRange(pos, end)
                 pos = end
             }
-            5 -> pos += 4
-            1 -> pos += 8
+            5 -> pos = minOf(pos + 4, data.size)
+            1 -> pos = minOf(pos + 8, data.size)
             else -> pos = data.size
         }
         return f
@@ -104,8 +108,8 @@ fun InputStream.readAll(): ByteArray {
     val tmp = ByteArray(16 * 1024)
     while (true) {
         val n = read(tmp)
-        if (n <= 0) break
-        out.write(tmp, 0, n)
+        if (n < 0) break
+        if (n > 0) out.write(tmp, 0, n)
     }
     return out.toByteArray()
 }

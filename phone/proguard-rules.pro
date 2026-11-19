@@ -1,7 +1,9 @@
-# Keep data models
--keep class com.applemusic.android.apple.** { *; }
--keep class com.applemusic.lyrics.core.** { *; }
--keep class com.applemusic.shared.** { *; }
+# Phone Companion (:phone) ProGuard / R8 rules
 
-# Keep Wearable Data Client
--keep class com.google.android.gms.wearable.** { *; }
+# Keep Android manifest components
+-keep class com.applemusic.lyricstool.phone.PhoneMainActivity { *; }
+-keep class com.applemusic.lyricstool.phone.AppleMusicLoginActivity { *; }
+
+# Consumer rules from :shared and Play Services Wearable handle library internals
+-dontwarn com.google.android.gms.wearable.**
+-dontwarn androidx.webkit.**

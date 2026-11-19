@@ -38,11 +38,37 @@ const val DEFAULT_LICENSE_SERVER =
 object Pssh {
     fun payloadFromKeyUri(keyUri: String): ByteArray {
         val parts = keyUri.split(",")
-        val b64 = parts[parts.size - 1]
+        val b64 = parts[parts.size - 1].trim()
+        if (b64.isEmpty()) {
+            throw IllegalArgumentException("密钥 URI 为空")
+        }
         val decoded = try {
             android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-        } catch (e: Throwable) {
+        } catch (_: Throwable) {
             throw IllegalArgumentException("密钥 URI 不是可解析的 base64: ${keyUri.take(64)}")
+        }
+        if (decoded.isEmpty()) {
+            throw IllegalArgumentException("密钥 URI 解码结果为空")
+        }
+        // 若解码结果是完整 MP4 pssh box（offset 4..7 == "pssh"），剥离盒头只取内部 WidevinePsshData payload
+        if (decoded.size >= 32 &&
+            decoded[4] == 'p'.code.toByte() && decoded[5] == 's'.code.toByte() &&
+            decoded[6] == 's'.code.toByte() && decoded[7] == 'h'.code.toByte()
+        ) {
+            val version = decoded[8].toInt() and 0xFF
+            var off = 28 // size(4) + 'pssh'(4) + ver/flags(4) + systemId(16)
+            if (version >= 1) {
+                if (off + 4 > decoded.size) return decoded
+                val kidCount = ByteOps.u32(decoded, off).toInt()
+                off += 4 + kidCount * 16
+            }
+            if (off + 4 <= decoded.size) {
+                val dataSize = ByteOps.u32(decoded, off).toInt()
+                off += 4
+                if (dataSize > 0 && off + dataSize <= decoded.size) {
+                    return decoded.copyOfRange(off, off + dataSize)
+                }
+            }
         }
         if (decoded.size > 30) return decoded
         return com.applemusic.android.util.PbWriter()

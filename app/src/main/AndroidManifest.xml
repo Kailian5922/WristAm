@@ -5,12 +5,13 @@
         android:required="true" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name="com.applemusic.lyricstool.wear.WristAmApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher_app"
         android:roundIcon="@mipmap/ic_launcher_app"
@@ -22,6 +23,7 @@
         <activity
             android:name="com.applemusic.lyricstool.wear.WearLyricsActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:theme="@style/Theme.LyricsWear">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -33,6 +35,8 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <action android:name="com.google.android.gms.wearable.REQUEST_RECEIVED" />
+                <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
                 <data
                     android:scheme="wear"
                     android:host="*"

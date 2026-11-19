@@ -7,13 +7,18 @@ import com.applemusic.android.lyrics.Lyrics
 import com.applemusic.android.lyrics.LyricsParser
 import com.applemusic.android.util.ChineseText
 import com.applemusic.lyricstool.data.qq.DESHelper
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.EOFException
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
 import java.util.zip.InflaterInputStream
+import kotlin.math.abs
 
 class QQMusicLyricsClient {
     private data class SearchMetadata(
@@ -72,8 +77,8 @@ class QQMusicLyricsClient {
     }
 
     private fun requestSearch(term: String, searchType: Int): JSONObject {
-        val encodedTerm = URLEncoder.encode(term, Charsets.UTF_8.name())
-        val pageSize = if (searchType == 7) 10 else 30
+        val encodedTerm = URLEncoder.encode(term.trim(), Charsets.UTF_8.name())
+        val pageSize = if (searchType == 7) 10 else 25
         val root = JSONObject(
             request("$SEARCH_URL?format=json&p=1&n=$pageSize&w=$encodedTerm&t=$searchType")
         )
@@ -141,10 +146,17 @@ class QQMusicLyricsClient {
         var firstError: Exception? = null
         val triedIds = HashSet<String>()
         var lineTimedFallback: FetchedLyrics? = null
-        val queries = metadata.flatMap { listOf(it.title, "${it.title} ${it.artist}") }
+        var fetchAttempts = 0
+
+        // 优先用“歌名 歌手”提高一次命中率，避免低效多次串行网络请求
+        val queries = metadata
+            .flatMap { listOf("${it.title} ${it.artist}".trim(), it.title.trim()) }
+            .filter { it.isNotBlank() }
             .distinctBy(::normalizeMatchText)
+            .take(3)
 
         for ((queryIndex, query) in queries.withIndex()) {
+            if (fetchAttempts >= MAX_LYRIC_FETCH_ATTEMPTS) break
             val matches = try {
                 searchSongs(query)
                     .mapIndexedNotNull { rank, candidate ->
@@ -163,21 +175,31 @@ class QQMusicLyricsClient {
                             .thenBy { it.durationDifferenceMs }
                             .thenBy { it.rank }
                     )
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 if (firstError == null) firstError = error
                 emptyList()
             }
 
-            for (match in matches.take(3)) {
+            for (match in matches.take(2)) {
+                if (fetchAttempts >= MAX_LYRIC_FETCH_ATTEMPTS) break
                 if (!triedIds.add(match.song.id)) continue
+                fetchAttempts++
                 try {
                     fetchLyrics(match.song)?.let { lyrics ->
                         if (lyrics.lyrics.wordTimedLines() > 0) return@withContext lyrics
                         if (lineTimedFallback == null) lineTimedFallback = lyrics
                     }
+                } catch (error: CancellationException) {
+                    throw error
                 } catch (error: Exception) {
                     if (firstError == null) firstError = error
                 }
+            }
+            // 已命中高置信度行级歌词且已尝试足够次数则提前结束
+            if (lineTimedFallback != null && matches.firstOrNull()?.score?.let { it >= 145 } == true) {
+                break
             }
         }
         lineTimedFallback?.let { return@withContext it }
@@ -197,44 +219,38 @@ class QQMusicLyricsClient {
         val candidateTitle = normalizeMatchText(candidate.title)
         val titleMatches = candidateTitle.isNotBlank() && titles.any { title ->
             candidateTitle == title ||
-                candidateTitle.contains(title) || title.contains(candidateTitle)
+                (title.length > 3 && candidateTitle.contains(title)) ||
+                (candidateTitle.length > 3 && title.contains(candidateTitle))
         }
         val candidateArtists = splitArtists(candidate.artist)
         val artistMatches = artistGroups.any { artists ->
             candidateArtists.any { candidateArtist ->
                 artists.any {
                     it == candidateArtist ||
-                        it.contains(candidateArtist) ||
-                        candidateArtist.contains(it)
+                        (candidateArtist.length >= 2 && it.contains(candidateArtist)) ||
+                        (it.length >= 2 && candidateArtist.contains(it))
                 }
             }
         }
         val candidateAlbum = normalizeMatchText(candidate.album)
         val albumMatches = candidateAlbum.isNotBlank() && albums.any { album ->
             album == candidateAlbum ||
-                album.contains(candidateAlbum) ||
-                candidateAlbum.contains(album)
+                (candidateAlbum.length > 3 && album.contains(candidateAlbum)) ||
+                (album.length > 3 && candidateAlbum.contains(album))
         }
         val durationDifference = if (durationMs > 0L && candidate.durationMs > 0L) {
-            kotlin.math.abs(candidate.durationMs - durationMs)
+            abs(candidate.durationMs - durationMs)
         } else {
             Long.MAX_VALUE
         }
         if (durationDifference != Long.MAX_VALUE && durationDifference > 45_000L) return null
 
-        val durationIsVeryClose = durationDifference <= CROSS_LANGUAGE_DURATION_TOLERANCE_MS
         val artistAndDurationMatch = !titleMatches &&
             artistMatches &&
             durationDifference <= TITLE_ONLY_DURATION_TOLERANCE_MS
-        val crossLanguageTopResult = !titleMatches &&
-            !artistMatches &&
-            rank == 0 &&
-            durationIsVeryClose
         val albumAndDurationMatch = albumMatches &&
             durationDifference <= ALBUM_MATCH_DURATION_TOLERANCE_MS
-        if (!titleMatches && !artistAndDurationMatch &&
-            !albumAndDurationMatch && !crossLanguageTopResult
-        ) {
+        if (!titleMatches && !artistAndDurationMatch && !albumAndDurationMatch) {
             return null
         }
         if (titleMatches && artistGroups.isNotEmpty() && !artistMatches &&
@@ -271,11 +287,12 @@ class QQMusicLyricsClient {
             .replace(Regex("""\{[^}]*\}"""), "")
             .replace(Regex("""[\p{P}\p{S}\s]+"""), "")
 
+    /** 支持单字符艺名（如 "V"、"K"）。 */
     private fun splitArtists(text: String): List<String> =
         Regex("[,/&、，;]+")
             .split(text)
             .map(::normalizeMatchText)
-            .filter { it.length > 1 }
+            .filter { it.isNotEmpty() }
 
     private data class RankedCandidate(
         val song: SongHit,
@@ -333,93 +350,85 @@ class QQMusicLyricsClient {
         val data = response.optJSONObject("data")
             ?: throw IllegalStateException("QQ 音乐歌词接口没有返回歌词数据")
         val originalPayload = firstPayload(data, "lyric") ?: return null
-        val original = decryptQrc(originalPayload)
+        val original = decryptPayload(originalPayload) ?: return null
         val lyrics = parseLyrics(original, "qq-qrc") ?: return null
 
         var translationWarning: String? = null
         val translation = firstPayload(data, "trans")?.let { payload ->
             try {
-                decryptQrc(payload)
-            } catch (error: IllegalStateException) {
+                decryptPayload(payload)
+            } catch (error: Exception) {
                 translationWarning = error.message ?: "QQ 音乐译文无法解码"
                 null
             }
         }
         val translatedLyrics = translation?.let { parseLyrics(it, "qq-translation") }
-        val romanization = firstPayload(data, "roma")?.let { payload ->
-            try {
-                decryptQrc(payload)
-            } catch (error: IllegalStateException) {
-                null
-            }
-        }
         return FetchedLyrics(
             lyrics = mergeQqTranslations(lyrics, translatedLyrics),
             ttml = null,
             translationWarning = translationWarning,
-            qqQrcDebugText = buildQrcDebugText(
-                "musicu.fcg GetPlayLyricInfo",
-                original,
-                translation,
-                romanization
-            )
+            qqQrcDebugText = null
         )
     }
 
-    private fun buildQrcDebugText(
-        endpoint: String,
-        original: String?,
-        translation: String?,
-        romanization: String?
-    ): String? {
-        if (original.isNullOrBlank() && translation.isNullOrBlank() && romanization.isNullOrBlank()) {
-            return null
-        }
-        return buildString {
-            appendLine("QQ Music decrypted lyric response")
-            appendLine("Endpoint: $endpoint")
-            appendLine("These are decoded source payloads, not generated LRC/TTML.")
-            appendLine()
-            appendLine("===== ORIGINAL QRC / LYRIC =====")
-            appendLine(original.orEmpty())
-            appendLine()
-            appendLine("===== TRANSLATION QRC / TRANS =====")
-            appendLine(translation.orEmpty())
-            appendLine()
-            appendLine("===== ROMANIZATION QRC / ROMA =====")
-            appendLine(romanization.orEmpty())
-        }
-    }
-
+    /**
+     * 对齐 QQ 译文：
+     * 1. 先剔除空白行、`"//"` 占位符与无效时间戳行（`startMs < 0`）；
+     * 2. 优先匹配精确/近似（≤400ms），再放宽到 ≤1000ms，避免信用行抢占唱词译文。
+     */
     private fun mergeQqTranslations(original: Lyrics, translated: Lyrics?): Lyrics {
         if (translated == null) return original
-        val translatedLines = translated.lines.sortedBy { it.startMs }
-        val usedTranslations = BooleanArray(translatedLines.size)
-        val mergedLines = original.lines.map { line ->
-            val matchIndex = translatedLines.indices
-                .asSequence()
-                .filter { index ->
-                    !usedTranslations[index] &&
-                        kotlin.math.abs(translatedLines[index].startMs - line.startMs) <=
-                        TRANSLATION_TIME_TOLERANCE_MS
-                }
-                .minWithOrNull(
-                    compareBy<Int> { index ->
-                        kotlin.math.abs(translatedLines[index].startMs - line.startMs)
-                    }.thenBy { index -> translatedLines[index].startMs }
-                )
-            val translation = matchIndex?.let { index ->
-                usedTranslations[index] = true
-                translatedLines[index].text
+        val translatedLines = translated.lines
+            .filter { line ->
+                line.startMs >= 0L &&
+                    line.text.isNotBlank() &&
+                    line.text.trim() != "//"
             }
-            LyricLine(
-                line.startMs,
-                line.endMs,
-                line.text,
-                line.words,
-                translation = translation?.takeIf { it.isNotBlank() },
-                key = line.key
-            )
+            .sortedBy { it.startMs }
+        if (translatedLines.isEmpty()) return original
+
+        val usedTranslations = BooleanArray(translatedLines.size)
+        val assigned = arrayOfNulls<String>(original.lines.size)
+
+        fun matchPass(maxToleranceMs: Long) {
+            for (origIdx in original.lines.indices) {
+                if (assigned[origIdx] != null) continue
+                val line = original.lines[origIdx]
+                if (line.isBlank || line.startMs < 0L) continue
+                val matchIndex = translatedLines.indices
+                    .asSequence()
+                    .filter { idx ->
+                        !usedTranslations[idx] &&
+                            abs(translatedLines[idx].startMs - line.startMs) <= maxToleranceMs
+                    }
+                    .minWithOrNull(
+                        compareBy<Int> { idx -> abs(translatedLines[idx].startMs - line.startMs) }
+                            .thenBy { idx -> translatedLines[idx].startMs }
+                    )
+                if (matchIndex != null) {
+                    usedTranslations[matchIndex] = true
+                    assigned[origIdx] = translatedLines[matchIndex].text
+                }
+            }
+        }
+
+        matchPass(400L)
+        matchPass(TRANSLATION_TIME_TOLERANCE_MS)
+
+        val mergedLines = original.lines.mapIndexed { idx, line ->
+            val trans = assigned[idx]?.takeIf { it.isNotBlank() && it != line.text }
+            if (trans == null) {
+                line
+            } else {
+                LyricLine(
+                    line.startMs,
+                    line.endMs,
+                    line.text,
+                    line.words,
+                    translation = trans,
+                    key = line.key
+                )
+            }
         }
         return Lyrics(mergedLines, original.synced, original.kind)
     }
@@ -429,11 +438,30 @@ class QQMusicLyricsClient {
             .map { data.optString(it).trim() }
             .firstOrNull { it.isNotEmpty() && it != "0" && it != "null" }
 
-    private fun decryptQrc(hex: String): String {
-        val digits = hex.filterNot(Char::isWhitespace)
-        if (digits.isEmpty() || digits.length % 16 != 0 || digits.any { it.digitToIntOrNull(16) == null }) {
-            throw IllegalStateException("QQ 音乐 QRC 密文格式无效")
+    /**
+     * 解密 QRC 密文，并自动兼容 QQ 音乐偶尔返回的明文 LRC 或 Base64 载荷。
+     */
+    private fun decryptPayload(payload: String): String? {
+        val trimmed = payload.trim()
+        if (trimmed.isEmpty()) return null
+        // 明文 LRC 或明文 XML 直接提取
+        if (trimmed.startsWith("[") || trimmed.startsWith("<")) {
+            return extractXmlLyricContent(trimmed)
         }
+        val digits = trimmed.filterNot(Char::isWhitespace)
+        val isHexQrc = digits.isNotEmpty() && digits.length % 16 == 0 &&
+            digits.all { it.digitToIntOrNull(16) != null }
+        if (!isHexQrc) {
+            // 尝试 Base64 明文回落
+            val decoded = runCatching {
+                Base64.decode(trimmed, Base64.DEFAULT).toString(Charsets.UTF_8).trimStart('\uFEFF')
+            }.getOrNull()
+            if (!decoded.isNullOrBlank() && (decoded.contains("[") || decoded.contains("<Lyric_1"))) {
+                return extractXmlLyricContent(decoded)
+            }
+            return null
+        }
+
         val encrypted = ByteArray(digits.length / 2) { index ->
             digits.substring(index * 2, index * 2 + 2).toInt(16).toByte()
         }
@@ -456,7 +484,12 @@ class QQMusicLyricsClient {
             InflaterInputStream(ByteArrayInputStream(decrypted)).use { inflater ->
                 val buffer = ByteArray(4096)
                 while (true) {
-                    val count = inflater.read(buffer)
+                    val count = try {
+                        inflater.read(buffer)
+                    } catch (eof: EOFException) {
+                        // DES 尾部补零可能触发流末尾 EOFException；若已解出有效字节则接受
+                        if (output.size() > 0) break else throw eof
+                    }
                     if (count < 0) break
                     if (output.size() + count > MAX_DECOMPRESSED_BYTES) {
                         throw IllegalStateException("QQ 音乐歌词解压后过大")
@@ -465,14 +498,30 @@ class QQMusicLyricsClient {
                 }
             }
         } catch (error: Exception) {
-            throw IllegalStateException("QQ 音乐 QRC 歌词解密失败", error)
+            if (output.size() == 0) {
+                throw IllegalStateException("QQ 音乐 QRC 歌词解密失败", error)
+            }
         }
         val decryptedText = output.toByteArray().toString(Charsets.UTF_8).trimStart('\uFEFF')
-        val xmlLyric = Regex(
-            """<Lyric_1\b[^>]*\bLyricContent="(.*?)"[^>]*/?>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        ).find(decryptedText)?.groupValues?.get(1)
-        return xmlLyric?.let(::decodeXmlAttribute) ?: decryptedText
+        return extractXmlLyricContent(decryptedText)
+    }
+
+    /**
+     * 安全提取 `<Lyric_1 ... LyricContent="...">`：贪婪定位最后一个关闭引号，
+     * 防止歌词内未转义双引号截断整首歌歌词。
+     */
+    private fun extractXmlLyricContent(text: String): String {
+        val markerIdx = text.indexOf("LyricContent=\"", ignoreCase = true)
+        if (markerIdx >= 0) {
+            val start = markerIdx + "LyricContent=\"".length
+            val closeTagIdx = text.lastIndexOf("/>")
+            val searchLimit = if (closeTagIdx > start) closeTagIdx else text.length
+            val endQuote = text.lastIndexOf('"', searchLimit - 1)
+            if (endQuote > start) {
+                return LyricsParser.unescape(text.substring(start, endQuote))
+            }
+        }
+        return text
     }
 
     private fun parseLyrics(content: String, kind: String): Lyrics? {
@@ -511,7 +560,13 @@ class QQMusicLyricsClient {
             }
             text.append(body.substring(cursor))
             val lyricText = text.toString().trim()
-            if (lyricText.isBlank()) return@mapNotNull null
+            if (lyricText.isBlank()) {
+                // 保留明确的间奏空行（>=3s）供呼吸点渲染
+                if (lineDuration >= 3_000L) {
+                    return@mapNotNull LyricLine(lineStart, lineStart + lineDuration, "", emptyList())
+                }
+                return@mapNotNull null
+            }
             val trimStart = text.indexOf(lyricText)
             val trimEnd = trimStart + lyricText.length
             val adjustedWords = words.mapNotNull { word ->
@@ -527,31 +582,15 @@ class QQMusicLyricsClient {
                 lyricText,
                 adjustedWords
             )
-        }.toList()
+        }.sortedBy { it.startMs }.toList()
         return if (lines.isEmpty()) LyricsParser.parsePlain(content, kind)
         else Lyrics(lines, synced = true, kind = kind)
     }
 
-    private fun decodeXmlAttribute(value: String): String {
-        val namedEntities = LyricsParser.unescape(value)
-        return Regex("""&#(x[0-9a-fA-F]+|\d+);""").replace(namedEntities) { match ->
-            val entity = match.groupValues[1]
-            val codePoint = if (entity.startsWith('x', ignoreCase = true)) {
-                entity.drop(1).toIntOrNull(16)
-            } else {
-                entity.toIntOrNull()
-            }
-            codePoint?.takeIf(Character::isValidCodePoint)?.let(Character::toChars)?.concatToString()
-                ?: match.value
-        }
-    }
-
-    private fun postJson(body: String): String {
-        return request(API_URL, body)
-    }
+    private fun postJson(body: String): String = request(API_URL, body)
 
     private fun request(url: String, body: String? = null): String {
-        val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+        val connection = URL(url).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 15_000
             connection.readTimeout = 30_000
@@ -578,8 +617,12 @@ class QQMusicLyricsClient {
                 throw IllegalStateException("QQ 音乐请求失败（HTTP $code）")
             }
             return response
-        } finally {
-            connection.disconnect()
+        } catch (t: Throwable) {
+            try {
+                connection.disconnect()
+            } catch (_: Throwable) {
+            }
+            throw t
         }
     }
 
@@ -587,8 +630,8 @@ class QQMusicLyricsClient {
         const val API_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
         const val SEARCH_URL = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
         const val MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+        const val MAX_LYRIC_FETCH_ATTEMPTS = 4
         const val TRANSLATION_TIME_TOLERANCE_MS = 1_000L
-        const val CROSS_LANGUAGE_DURATION_TOLERANCE_MS = 2_500L
         const val ALBUM_MATCH_DURATION_TOLERANCE_MS = 5_000L
         const val TITLE_ONLY_DURATION_TOLERANCE_MS = 5_000L
     }

@@ -4,25 +4,14 @@ import com.applemusic.android.util.Logx
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 
 /**
- * 资料库同步 —— 对应鸿蒙版 `AppleLibrarySync.ets`。
- *
- * 原版把数据落到 HarmonyOS 的 RDB（关系型数据库）并重建聚合表；
- * 安卓这版只有一个用户、一份资料库，没必要引入 Room + KSP，
- * 所以落成一份 JSON 快照（`filesDir/library.json`），同步后重建内存聚合。
- *
- * 同步内容：
- *   syncSongs()            分页拉 /v1/me/library/songs（include=albums,artists）
- *                          → 写快照 → 顺手刷新「艺人官方头像」
- *   syncPlaylists()        歌单元数据
- *   syncAllPlaylistTracks() 逐个歌单拉曲目（自动歌单会 404，按空歌单处理）
+ * 资料库同步：拉取歌曲、艺人官方头像与歌单元数据，原子落盘 `filesDir/library.json`。
  */
 object AppleLibrarySync {
 
     private const val TAG = "AppleLibrarySync"
-
-    /** 单页大小（Apple 上限 100）。 */
     const val PAGE = 100
 
     class Result {
@@ -31,7 +20,6 @@ object AppleLibrarySync {
         var message = ""
     }
 
-    /** 本地歌曲行（对应鸿蒙版的 MusicSongRow，字段按需裁剪）。 */
     class SongRow {
         var appleId = ""
         var uri = ""
@@ -45,9 +33,9 @@ object AppleLibrarySync {
         var trackNumber = 0
         var discNumber = 0
         var isLibrary = true
-        /** 目录歌曲 id（换密钥必须用它） */
         var catalogId = ""
         var artistId = ""
+        var isrc = ""
 
         fun toJson(): JSONObject = JSONObject().apply {
             put("appleId", appleId)
@@ -64,6 +52,7 @@ object AppleLibrarySync {
             put("isLibrary", isLibrary)
             put("catalogId", catalogId)
             put("artistId", artistId)
+            put("isrc", isrc)
         }
 
         companion object {
@@ -82,6 +71,7 @@ object AppleLibrarySync {
                 isLibrary = o.optBoolean("isLibrary", true)
                 catalogId = o.optString("catalogId", "")
                 artistId = o.optString("artistId", "")
+                isrc = o.optString("isrc", "")
             }
         }
     }
@@ -112,7 +102,6 @@ object AppleLibrarySync {
         }
     }
 
-    /** AppleSong → SongRow（uri 用 `apple:<id>` 作为播放标识）。 */
     fun toRow(s: AppleSong): SongRow = SongRow().apply {
         appleId = s.id
         title = s.name.ifEmpty { "未知歌曲" }
@@ -128,19 +117,20 @@ object AppleLibrarySync {
         isLibrary = s.isLibrary
         catalogId = s.catalogId
         artistId = s.artistId
+        isrc = s.isrc
     }
 
     /**
-     * 全量同步资料库歌曲（自动分页）。
-     *
-     * @return 歌曲行列表；艺人头像在内部顺手刷新
+     * 全量同步资料库歌曲并同时返回官方艺人头像（消除重复拉取）。
      */
-    fun fetchSongs(api: AppleApi, onProgress: ((Int, String) -> Unit)? = null): List<SongRow> {
+    fun fetchSongsWithAvatars(
+        api: AppleApi,
+        onProgress: ((Int, String) -> Unit)? = null
+    ): Pair<List<SongRow>, Map<String, String>> {
         val report: (Int, String) -> Unit = { p, n -> onProgress?.invoke(p, n) }
         api.ensureReady()
         report(2, "读取资料库")
         val all = ArrayList<SongRow>()
-        // 每位艺人只记一首歌的目录 id：艺人头像是按艺人取的，几次请求就能覆盖整库
         val avatarProbe = LinkedHashMap<String, String>()
         var offset = 0
         var page = api.getLibrarySongs(PAGE, offset)
@@ -158,40 +148,38 @@ object AppleLibrarySync {
             }
             offset += page.items.size
             report(2 + minOf(80, offset / 10), "已读取 $offset 首")
-            if (page.items.size < PAGE) break
-            page = api.getLibrarySongs(PAGE, offset)
+            if (page.next.isBlank() || page.items.size < PAGE) break
+            page = try {
+                api.getLibrarySongs(PAGE, offset)
+            } catch (e: Throwable) {
+                if (e.message?.contains("404") == true) break
+                throw e
+            }
             guard++
         }
         Logx.i(TAG, "拉取完成，共 ${all.size} 首（Apple 声明 total=$declaredTotal）")
-        if (declaredTotal > 0 && all.size != declaredTotal) {
-            Logx.w(TAG, "资料库曲目数与 Apple 声明不一致：拉取=${all.size} total=$declaredTotal")
-        }
         report(92, "更新艺人头像")
         val avatars = fetchArtistAvatars(api, avatarProbe)
         report(100, "同步完成，共 ${all.size} 首")
-        return all
+        return all to avatars
     }
 
-    /**
-     * 用「每位艺人一首歌」的目录 id 批量换取 Apple Music 官方艺人头像。
-     *
-     * 资料库接口本身不返回艺人头像，但目录歌曲接口的 `relationships.artists` 带
-     * `attributes.artwork`；一次请求可带 100 个 id，整库通常只要两三次请求。
-     *
-     * @return 艺人名 → 头像 URL
-     */
+    fun fetchSongs(api: AppleApi, onProgress: ((Int, String) -> Unit)? = null): List<SongRow> =
+        fetchSongsWithAvatars(api, onProgress).first
+
     fun fetchArtistAvatars(api: AppleApi, probe: Map<String, String>): Map<String, String> {
         val avatars = HashMap<String, String>()
         if (probe.isEmpty()) return avatars
         val songIds = ArrayList<String>(probe.keys.size)
         val bySongId = HashMap<String, String>()
         for ((artistName, songId) in probe) {
+            if (songId.isBlank() || songId.startsWith("i.")) continue
             songIds.add(songId)
             bySongId[songId] = artistName
         }
         var i = 0
         while (i < songIds.size) {
-            val slice = songIds.subList(i, minOf(i + 100, songIds.size))
+            val slice = songIds.subList(i, minOf(i + 50, songIds.size))
             val found = api.catalogArtistsForSongs(slice)
             for ((songId, artist) in found) {
                 val name = bySongId[songId] ?: continue
@@ -199,13 +187,12 @@ object AppleLibrarySync {
                     avatars[name] = artist.artworkUrl
                 }
             }
-            i += 100
+            i += 50
         }
         Logx.i(TAG, "艺人官方头像已更新：${avatars.size} 位")
         return avatars
     }
 
-    /** 全量同步资料库歌单（只同步元数据，曲目在打开歌单时按需拉取）。 */
     fun fetchPlaylists(api: AppleApi, onProgress: ((Int, String) -> Unit)? = null): List<PlaylistRow> {
         val report: (Int, String) -> Unit = { p, n -> onProgress?.invoke(p, n) }
         api.ensureReady()
@@ -215,30 +202,31 @@ object AppleLibrarySync {
         var guard = 0
         while (page.items.isNotEmpty() && guard < 50) {
             for (p in page.items) {
-                val row = PlaylistRow()
-                row.id = p.id
-                row.name = p.name.ifEmpty { "未命名歌单" }
-                row.description = p.description
-                row.coverUrl = p.artworkUrl
-                row.trackCount = p.trackCount
-                all.add(row)
+                all.add(
+                    PlaylistRow().apply {
+                        id = p.id
+                        name = p.name.ifEmpty { "未命名歌单" }
+                        description = p.description
+                        coverUrl = p.artworkUrl
+                        trackCount = p.trackCount
+                    }
+                )
             }
             offset += page.items.size
             report(minOf(95, 10 + offset), "已读取 $offset 个歌单")
-            if (page.items.size < PAGE) break
-            page = api.getLibraryPlaylists(PAGE, offset)
+            if (page.next.isBlank() || page.items.size < PAGE) break
+            page = try {
+                api.getLibraryPlaylists(PAGE, offset)
+            } catch (e: Throwable) {
+                if (e.message?.contains("404") == true) break
+                throw e
+            }
             guard++
         }
         Logx.i(TAG, "歌单同步完成: ${all.size}")
         return all
     }
 
-    /**
-     * 拉取某个歌单的全部曲目。
-     *
-     * Apple 的「自动歌单」（喜爱歌曲/睡眠/新歌…）走另一套内部服务，
-     * 资料库接口对它们返回 404 —— 这里按空歌单处理并落日志。
-     */
     fun loadPlaylistSongs(api: AppleApi, playlistId: String): List<SongRow> {
         val rows = ArrayList<SongRow>()
         var offset = 0
@@ -258,29 +246,32 @@ object AppleLibrarySync {
             runCatching { api.localizeCatalogSongs(page.items, "cn") }
             for (s in page.items) {
                 val row = toRow(s)
-                // 不在资料库里的曲目：标记为非资料库，避免污染三个板块
                 row.isLibrary = false
                 rows.add(row)
             }
             offset += page.items.size
-            if (page.items.size < PAGE) break
-            page = api.getPlaylistTracks(playlistId, PAGE, offset)
+            if (page.next.isBlank() || page.items.size < PAGE) break
+            page = try {
+                api.getPlaylistTracks(playlistId, PAGE, offset)
+            } catch (e: Throwable) {
+                if (e.message?.contains("404") == true) break
+                throw e
+            }
             guard++
         }
         Logx.i(TAG, "歌单 $playlistId 曲目 ${rows.size} 首")
         return rows
     }
 
-    // ─────────────────────── 快照持久化 ───────────────────────
-
     class Snapshot {
         var songs = ArrayList<SongRow>()
         var playlists = ArrayList<PlaylistRow>()
-        var playlistTracks = HashMap<String, List<String>>() // playlistId → uri 列表
+        var playlistTracks = HashMap<String, List<String>>()
         var avatars = HashMap<String, String>()
         var syncedAt = 0L
     }
 
+    /** 原子落盘 library.json（tmp + fsync + renameTo），避免并发写或强杀导致快照损坏。 */
     fun save(file: File, snap: Snapshot) {
         val root = JSONObject()
         root.put("syncedAt", snap.syncedAt)
@@ -296,7 +287,22 @@ object AppleLibrarySync {
         val avObj = JSONObject()
         for ((k, v) in snap.avatars) avObj.put(k, v)
         root.put("avatars", avObj)
-        file.writeText(root.toString())
+
+        val bytes = root.toString().toByteArray(Charsets.UTF_8)
+        file.parentFile?.mkdirs()
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        FileOutputStream(tmp).use { fos ->
+            fos.write(bytes)
+            fos.flush()
+            try {
+                fos.fd.sync()
+            } catch (_: Throwable) {
+            }
+        }
+        if (!tmp.renameTo(file)) {
+            tmp.copyTo(file, overwrite = true)
+            tmp.delete()
+        }
         Logx.i(TAG, "快照已保存：${snap.songs.size} 首 / ${snap.playlists.size} 个歌单 → ${file.absolutePath}")
     }
 
@@ -307,14 +313,23 @@ object AppleLibrarySync {
             val snap = Snapshot()
             snap.syncedAt = root.optLong("syncedAt", 0)
             val songsArr = root.optJSONArray("songs") ?: JSONArray()
-            for (i in 0 until songsArr.length()) snap.songs.add(SongRow.fromJson(songsArr.getJSONObject(i)))
+            for (i in 0 until songsArr.length()) {
+                val obj = songsArr.optJSONObject(i) ?: continue
+                snap.songs.add(SongRow.fromJson(obj))
+            }
             val plArr = root.optJSONArray("playlists") ?: JSONArray()
-            for (i in 0 until plArr.length()) snap.playlists.add(PlaylistRow.fromJson(plArr.getJSONObject(i)))
+            for (i in 0 until plArr.length()) {
+                val obj = plArr.optJSONObject(i) ?: continue
+                snap.playlists.add(PlaylistRow.fromJson(obj))
+            }
             root.optJSONObject("playlistTracks")?.let { o ->
                 for (k in o.keys()) {
                     val arr = o.optJSONArray(k) ?: continue
                     val list = ArrayList<String>(arr.length())
-                    for (i in 0 until arr.length()) list.add(arr.optString(i, ""))
+                    for (i in 0 until arr.length()) {
+                        val u = arr.optString(i, "")
+                        if (u.isNotEmpty()) list.add(u)
+                    }
                     snap.playlistTracks[k] = list
                 }
             }

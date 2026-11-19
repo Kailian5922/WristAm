@@ -141,7 +141,7 @@ object Mp4Remuxer {
         // mvex/trex：缺省样本参数
         Mp4.find(data, "mvex", moov.bodyStart, moov.bodyEnd)?.let { mvex ->
             for (trex in Mp4.boxes(data, mvex.bodyStart, mvex.bodyEnd)) {
-                if (trex.type != "trex") continue
+                if (trex.type != "trex" || trex.bodyStart + 20 > trex.bodyEnd) continue
                 val tid = Mp4.u32(data, trex.bodyStart + 4).toInt()
                 val dur = Mp4.u32(data, trex.bodyStart + 12).toInt()
                 val size = Mp4.u32(data, trex.bodyStart + 16).toInt()
@@ -235,7 +235,7 @@ object Mp4Remuxer {
                 )
                 trakOut.add(makeBox("trak", concat(patchDuration(t.tkhd!!, movieDuration), mdia)))
             }
-            val newMvhd = patchMvhdDuration(data, mvhd, maxMovieDuration.toInt())
+            val newMvhd = patchMvhdDuration(data, mvhd, maxMovieDuration)
             return makeBox(
                 "moov",
                 concat(newMvhd, *trakOut.toTypedArray())
@@ -297,6 +297,7 @@ object Mp4Remuxer {
         for (traf in Mp4.boxes(data, moof.bodyStart, moof.bodyEnd)) {
             if (traf.type != "traf") continue
             val tfhd = Mp4.find(data, "tfhd", traf.bodyStart, traf.bodyEnd) ?: return false
+            if (tfhd.bodyStart + 8 > tfhd.bodyEnd) return false
             val tFlags = (Mp4.u32(data, tfhd.bodyStart) and 0xFFFFFF).toInt()
             val trackId = Mp4.u32(data, tfhd.bodyStart + 4).toInt()
             val track = tracks.firstOrNull { it.id == trackId } ?: return false
@@ -304,65 +305,89 @@ object Mp4Remuxer {
             var p = tfhd.bodyStart + 8
             var baseDataOffset = -1L
             if (tFlags and 0x000001 != 0) {
+                if (p + 8 > tfhd.bodyEnd) return false
                 baseDataOffset = Mp4.u64(data, p)
                 p += 8
             }
-            if (tFlags and 0x000002 != 0) p += 4          // sample_description_index
+            if (tFlags and 0x000002 != 0) {
+                if (p + 4 > tfhd.bodyEnd) return false
+                p += 4 // sample_description_index
+            }
             var defDuration = trexDefaults[trackId]?.get(0) ?: 0
             var defSize = trexDefaults[trackId]?.get(1) ?: 0
             if (tFlags and 0x000008 != 0) {
+                if (p + 4 > tfhd.bodyEnd) return false
                 defDuration = Mp4.u32(data, p).toInt()
                 p += 4
             }
             if (tFlags and 0x000010 != 0) {
+                if (p + 4 > tfhd.bodyEnd) return false
                 defSize = Mp4.u32(data, p).toInt()
                 p += 4
             }
-            if (tFlags and 0x000020 != 0) p += 4          // default_sample_flags
+            if (tFlags and 0x000020 != 0) {
+                if (p + 4 > tfhd.bodyEnd) return false
+                p += 4 // default_sample_flags
+            }
 
-            // 数据基准：`base_data_offset` 存在就用它，否则按规范相对 `moof` 起点
-            // （Apple 会置 default-base-is-moof，两者等价）
             val base = if (baseDataOffset >= 0) baseDataOffset else moof.start.toLong()
+            var nextImplicitAt = mdat?.bodyStart ?: -1
 
             for (trun in Mp4.boxes(data, traf.bodyStart, traf.bodyEnd)) {
                 if (trun.type != "trun") continue
+                if (trun.bodyStart + 8 > trun.bodyEnd) return false
                 val rFlags = (Mp4.u32(data, trun.bodyStart) and 0xFFFFFF).toInt()
-                val count = Mp4.u32(data, trun.bodyStart + 4).toInt()
-                if (count <= 0) continue
+                val countLong = Mp4.u32(data, trun.bodyStart + 4)
+                if (countLong <= 0L || countLong > 2_000_000L) continue
+                val count = countLong.toInt()
                 var q = trun.bodyStart + 8
                 var dataOffset = Int.MIN_VALUE
                 if (rFlags and 0x000001 != 0) {
+                    if (q + 4 > trun.bodyEnd) return false
                     dataOffset = Mp4.i32(data, q)
                     q += 4
                 }
-                if (rFlags and 0x000004 != 0) q += 4      // first_sample_flags
-
-                val at0 = if (dataOffset != Int.MIN_VALUE) {
-                    (base + dataOffset).toInt()
-                } else {
-                    mdat?.bodyStart ?: return false
+                if (rFlags and 0x000004 != 0) {
+                    if (q + 4 > trun.bodyEnd) return false
+                    q += 4 // first_sample_flags
                 }
-                if (at0 < 0 || at0 > data.size) return false
-                var at = at0
+
+                val at0Long = if (dataOffset != Int.MIN_VALUE) {
+                    base + dataOffset.toLong()
+                } else {
+                    if (nextImplicitAt < 0) return false
+                    nextImplicitAt.toLong()
+                }
+                if (at0Long < 0L || at0Long > data.size.toLong()) return false
+                var at = at0Long.toInt()
 
                 val startCount = track.samples.size
                 for (k in 0 until count) {
                     var dur = defDuration
                     var size = defSize
                     if (rFlags and 0x000100 != 0) {
+                        if (q + 4 > trun.bodyEnd) return false
                         dur = Mp4.u32(data, q).toInt()
                         q += 4
                     }
                     if (rFlags and 0x000200 != 0) {
+                        if (q + 4 > trun.bodyEnd) return false
                         size = Mp4.u32(data, q).toInt()
                         q += 4
                     }
-                    if (rFlags and 0x000400 != 0) q += 4  // sample_flags
-                    if (rFlags and 0x000800 != 0) q += 4  // composition time offset
-                    if (size <= 0 || at + size > data.size) return false
+                    if (rFlags and 0x000400 != 0) {
+                        if (q + 4 > trun.bodyEnd) return false
+                        q += 4 // sample_flags
+                    }
+                    if (rFlags and 0x000800 != 0) {
+                        if (q + 4 > trun.bodyEnd) return false
+                        q += 4 // composition time offset
+                    }
+                    if (size <= 0 || size > data.size - at) return false
                     track.samples.add(Sample(size, if (dur > 0) dur else 1024, at))
                     at += size
                 }
+                nextImplicitAt = at
                 if (track.samples.size == startCount) return false
                 track.chunkCounts.add(track.samples.size - startCount)
             }
@@ -372,7 +397,7 @@ object Mp4Remuxer {
 
     // ─────────────────────── 重建 stbl 子 box ───────────────────────
 
-    /** `stts`：时长做行程编码（相邻相同的时长合并成一条）。 */
+    /** `stts`：时长做行程编码（makeFullBox 已包含 4 字节 version/flags，payload 只需 4 + entries*8）。 */
     private fun makeStts(samples: List<Sample>): ByteArray {
         val entries = ArrayList<IntArray>(64)
         var cur = samples[0].duration
@@ -388,7 +413,7 @@ object Mp4Remuxer {
         }
         entries.add(intArrayOf(n, cur))
 
-        val body = ByteArray(8 + entries.size * 8)
+        val body = ByteArray(4 + entries.size * 8)
         putU32(body, 0, entries.size)
         var p = 4
         for (e in entries) {
@@ -399,7 +424,7 @@ object Mp4Remuxer {
         return makeFullBox("stts", 0, 0, body)
     }
 
-    /** `stsc`：chunk → 样本数（相邻相同的一起编码）。 */
+    /** `stsc`：chunk → 样本数（payload = 4 + entries*12）。 */
     private fun makeStsc(chunkCounts: List<Int>): ByteArray {
         val entries = ArrayList<IntArray>(64)
         var i = 0
@@ -407,12 +432,12 @@ object Mp4Remuxer {
             val c = chunkCounts[i]
             var j = i
             while (j < chunkCounts.size && chunkCounts[j] == c) j++
-            entries.add(intArrayOf(i + 1, c, 1))   // first_chunk, samples_per_chunk, desc_index
+            entries.add(intArrayOf(i + 1, c, 1))
             i = j
         }
         if (entries.isEmpty()) entries.add(intArrayOf(1, 1, 1))
 
-        val body = ByteArray(8 + entries.size * 12)
+        val body = ByteArray(4 + entries.size * 12)
         putU32(body, 0, entries.size)
         var p = 4
         for (e in entries) {
@@ -424,10 +449,10 @@ object Mp4Remuxer {
         return makeFullBox("stsc", 0, 0, body)
     }
 
-    /** `stsz`：每个样本的字节数。 */
+    /** `stsz`：每个样本的字节数（payload = 8 + samples*4）。 */
     private fun makeStsz(samples: List<Sample>): ByteArray {
-        val body = ByteArray(12 + samples.size * 4)
-        putU32(body, 0, 0)                    // sample_size = 0 → 逐样本给
+        val body = ByteArray(8 + samples.size * 4)
+        putU32(body, 0, 0)
         putU32(body, 4, samples.size)
         var p = 8
         for (s in samples) {
@@ -437,9 +462,9 @@ object Mp4Remuxer {
         return makeFullBox("stsz", 0, 0, body)
     }
 
-    /** `stco`：每个 chunk 在新 `mdat` 里的偏移（文件 ≤ 2GB，够用）。 */
+    /** `stco`：每个 chunk 在新 `mdat` 里的偏移（payload = 4 + offsets*4）。 */
     private fun makeStco(offsets: IntArray): ByteArray {
-        val body = ByteArray(8 + offsets.size * 4)
+        val body = ByteArray(4 + offsets.size * 4)
         putU32(body, 0, offsets.size)
         var p = 4
         for (o in offsets) {
@@ -452,6 +477,7 @@ object Mp4Remuxer {
     // ─────────────────────── 时长与字段读写 ───────────────────────
 
     private fun readTimescale(data: ByteArray, box: Box): Int {
+        if (box.bodyStart >= data.size) return -1
         val v = data[box.bodyStart].toInt() and 0xFF
         val off = if (v == 1) box.bodyStart + 20 else box.bodyStart + 12
         if (off + 4 > data.size) return -1
@@ -460,6 +486,7 @@ object Mp4Remuxer {
 
     /** `tkhd` 里的 track_ID。 */
     private fun readTrackId(data: ByteArray, tkhd: Box): Int {
+        if (tkhd.bodyStart >= data.size) return -1
         val v = data[tkhd.bodyStart].toInt() and 0xFF
         val off = if (v == 1) tkhd.bodyStart + 20 else tkhd.bodyStart + 12
         if (off + 4 > data.size) return -1
@@ -469,17 +496,17 @@ object Mp4Remuxer {
     /** 改 `mdhd`/`tkhd` 的 duration（版本 0 = 32 位，版本 1 = 64 位）。 */
     private fun patchDuration(box: ByteArray, duration: Long): ByteArray {
         val out = box.copyOf()
-        val v = out[8].toInt() and 0xFF          // box 头 8 字节后是 version
+        if (out.size < 12) return out
+        val v = out[8].toInt() and 0xFF
         val body = 8
-        // mdhd：duration 在 +16(v0)/+24(v1)；tkhd：+20(v0)/+28(v1)
-        // 用 box 类型区分
         val type = String(out, 4, 4, Charsets.ISO_8859_1)
         val off = when (type) {
             "mdhd" -> if (v == 1) body + 24 else body + 16
             "tkhd" -> if (v == 1) body + 28 else body + 20
             else -> return out
         }
-        if (off + 4 > out.size) return out
+        val need = if (v == 1) 8 else 4
+        if (off + need > out.size) return out
         if (v == 1) {
             putU32(out, off, (duration ushr 32).toInt())
             putU32(out, off + 4, duration.toInt())
@@ -489,18 +516,20 @@ object Mp4Remuxer {
         return out
     }
 
-    /** 改 `mvhd` 的 duration。 */
-    private fun patchMvhdDuration(data: ByteArray, mvhd: Box, duration: Int): ByteArray {
+    /** 改 `mvhd` 的 duration（支持 64 位 v1 完整写入）。 */
+    private fun patchMvhdDuration(data: ByteArray, mvhd: Box, duration: Long): ByteArray {
         val out = data.copyOfRange(mvhd.start, mvhd.bodyEnd)
+        if (out.size < 12) return out
         val v = out[8].toInt() and 0xFF
         val body = 8
         val off = if (v == 1) body + 24 else body + 16
-        if (off + 4 > out.size) return out
+        val need = if (v == 1) 8 else 4
+        if (off + need > out.size) return out
         if (v == 1) {
-            putU32(out, off, 0)
-            putU32(out, off + 4, duration)
+            putU32(out, off, (duration ushr 32).toInt())
+            putU32(out, off + 4, duration.toInt())
         } else {
-            putU32(out, off, duration)
+            putU32(out, off, duration.toInt())
         }
         return out
     }

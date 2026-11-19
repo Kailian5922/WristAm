@@ -33,7 +33,9 @@ data class AppleSong(
      * 目录歌曲 id（playParams.catalogId）。
      * 资料库歌曲的 id 是 `i.xxx`，但拿它才能批量向目录请求「这首歌的主艺人」。
      */
-    var catalogId: String = ""
+    var catalogId: String = "",
+    /** 完整关联艺人列表 (artistId to artistName)，避免靠正则拆艺人名误伤含 &/, 的乐队名。 */
+    var artists: List<Pair<String, String>> = emptyList()
 )
 
 data class AppleAlbum(

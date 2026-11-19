@@ -102,11 +102,12 @@ class MediaDrmKeyFetcher(
                 }
             }
             try {
-                d?.close()
-            } catch (_: Throwable) {
-            }
-            try {
-                d?.release()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    d?.close()
+                } else {
+                    @Suppress("DEPRECATION")
+                    d?.release()
+                }
             } catch (_: Throwable) {
             }
         }

@@ -72,26 +72,30 @@
 
 ```
 WristAm/
-├── app/               # [Wear OS 端] 主手表应用
-│   ├── wear/          # 播放界面、歌词视图、控制盘、Token 监听服务
-│   └── res/           # 手表专用矢量图标、排版字体 (Outfit, Plus Jakarta Sans)
+├── app/               # [Wear OS 端] 主手表应用 (MVVM + SwipeDismissableNavHost)
+│   ├── wear/
+│   │   ├── di/        # Application 级轻量依赖注入容器 (WearAppContainer)
+│   │   ├── data/      # 鉴权、播放、单飞歌词、收藏、离线下载、资料库、电台与艺人仓库
+│   │   ├── viewmodel/ # Jetpack ViewModel 状态管理层
+│   │   └── ui/        # Horologist 主题动态取色、波浪形变控件、逐字歌词与各功能页面
+│   └── res/           # 手表专用矢量图标、Wear 能力声明、字体 (Outfit, Plus Jakarta Sans)
 │
 ├── phone/             # [Android 手机端] 配套辅助应用
-│   ├── phone/         # Apple ID 网页登录拦截器、跨端令牌中继器
+│   ├── phone/         # Apple ID 网页登录拦截器、跨端令牌中继器 (实时 ACK + 离线 DataLayer)
 │   └── res/           # 手机端 Material 3 界面资源
 │
 ├── lyrics-core/       # [歌词解析核心库]
-│   └── lyrics/        # 高性能 TTML/LRC 格式解析器、字词级别时轴实体定义
+│   └── lyrics/        # XmlPullParser TTML 与 LRC 解析器、字词级别时轴实体定义
 │
 └── shared/            # [共享业务与流媒体层]
-    ├── apple/         # Apple Music REST API、曲库同步、搜索、下载器
+    ├── apple/         # Apple Music REST API、曲库同步、搜索、离线/临时隔离缓存与下载器
     ├── cenc/          # CENC 样本级解密器 (AES-CTR)
     ├── drm/           # MediaDrm 接口与 Widevine 密钥获取器
     ├── hls/           # HLS 播放列表流解析与切片管理
     ├── mp4/           # MP4 容器解包、Box 格式解析、流清洗与 Remuxer
     ├── widevine/      # Widevine CDM 原生客户端逻辑、Proto 协议序列化
-    ├── player/        # Media3 ExoPlayer 封装、前台通知控制器
-    └── data/          # 官方/备用歌词抓取器、磁盘二级 LRU 缓存、DES 解密
+    ├── player/        # Media3 ExoPlayer 单通道可取消引擎、前台通知控制器
+    └── data/          # 官方/备用歌词抓取器、双层 LRU 磁盘缓存、DES 解密
 ```
 
 ---

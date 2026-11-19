@@ -2,27 +2,35 @@ package com.applemusic.lyricstool.phone
 
 import android.app.Activity
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PersistableBundle
+import android.webkit.CookieManager
+import android.webkit.WebStorage
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.FileDownload
-import androidx.compose.material.icons.filled.Login
-import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Watch
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -31,7 +39,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.applemusic.lyricstool.data.AppleLyricsClient
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 
@@ -39,6 +49,7 @@ class PhoneMainActivity : ComponentActivity() {
     private val client by lazy { AppleLyricsClient(applicationContext) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme(
@@ -65,7 +76,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
     val snackbarHostState = remember { SnackbarHostState() }
 
     var sessionRevision by remember { mutableIntStateOf(0) }
-    var pendingExportToken by remember { mutableStateOf<String?>(null) }
+    var pendingExportToken by rememberSaveable { mutableStateOf<String?>(null) }
     var isSendingToWatch by remember { mutableStateOf(false) }
 
     val loginLauncher = rememberLauncherForActivityResult(
@@ -86,17 +97,17 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
         val token = pendingExportToken
         pendingExportToken = null
         if (uri != null && !token.isNullOrBlank()) {
-            try {
-                context.contentResolver.openOutputStream(uri)?.use { stream ->
-                    OutputStreamWriter(stream, StandardCharsets.UTF_8).use { writer ->
-                        writer.write(token)
+            scope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openOutputStream(uri)?.use { stream ->
+                            OutputStreamWriter(stream, StandardCharsets.UTF_8).use { writer ->
+                                writer.write(token)
+                            }
+                        } ?: error("无法打开目标文件")
                     }
-                }
-                scope.launch {
                     snackbarHostState.showSnackbar("密钥文件已成功导出保存！")
-                }
-            } catch (e: Exception) {
-                scope.launch {
+                } catch (e: Exception) {
                     snackbarHostState.showSnackbar("导出文件失败：${e.message ?: "未知错误"}")
                 }
             }
@@ -107,15 +118,15 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
         client.reloadSavedSession()
     }
 
-    val signedIn = client.isSignedIn
-    val token = client.userToken
+    val signedIn = remember(sessionRevision) { client.isSignedIn }
+    val token = remember(sessionRevision) { client.userToken }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Text(
-                        "手表密钥同步伴侣",
+                        "WristAM 手机同步伴侣",
                         fontWeight = FontWeight.Bold,
                         fontSize = 20.sp
                     )
@@ -132,6 +143,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
@@ -148,7 +160,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Icon(
-                        imageVector = if (signedIn) Icons.Default.CheckCircle else Icons.Default.Login,
+                        imageVector = if (signedIn) Icons.Default.CheckCircle else Icons.AutoMirrored.Filled.Login,
                         contentDescription = null,
                         tint = if (signedIn) Color(0xFF2E7D32) else Color(0xFFED6C02),
                         modifier = Modifier.size(32.dp)
@@ -183,7 +195,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                         .height(50.dp),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Icon(Icons.Default.Login, contentDescription = null)
+                    Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("登录 Apple Music", fontSize = 16.sp)
                 }
@@ -191,15 +203,23 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                 OutlinedButton(
                     onClick = {
                         client.logout()
+                        // 同时清理 WebView Cookie 与存储，确保下次登录可真正切换 Apple ID 账号
+                        try {
+                            val cm = CookieManager.getInstance()
+                            cm.removeAllCookies(null)
+                            cm.flush()
+                            WebStorage.getInstance().deleteAllData()
+                        } catch (_: Exception) {
+                        }
                         sessionRevision++
                         scope.launch {
-                            snackbarHostState.showSnackbar("已退出登录")
+                            snackbarHostState.showSnackbar("已退出登录并清理网页登录缓存")
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Icon(Icons.Default.Logout, contentDescription = null)
+                    Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("退出登录 / 切换账号")
                 }
@@ -212,7 +232,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                     fontWeight = FontWeight.Bold
                 )
 
-                // 核心功能 1：一键无线同步至手表
+                // 核心功能 1：一键无线同步至手表（实时 ACK + 离线 DataLayer 队列兜底）
                 Button(
                     onClick = {
                         if (isSendingToWatch) return@Button
@@ -252,7 +272,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                 FilledTonalButton(
                     onClick = {
                         pendingExportToken = token
-                        createDocumentLauncher.launch("lyrics-account-token.txt")
+                        createDocumentLauncher.launch("wristam-account-token.txt")
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -261,17 +281,26 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                 ) {
                     Icon(Icons.Default.FileDownload, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("导出为密钥文件 (lyrics-account-token.txt)")
+                    Text("导出为密钥文件 (wristam-account-token.txt)")
                 }
 
-                // 备用功能 3：复制密钥到剪贴板
+                // 备用功能 3：复制密钥到剪贴板（标记为敏感内容防止明文预览弹窗）
                 OutlinedButton(
                     onClick = {
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val clip = ClipData.newPlainText("Apple Music Token", token)
+                        val clip = ClipData.newPlainText("Apple Music Token", token).apply {
+                            description.extras = PersistableBundle().apply {
+                                val key = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    ClipDescription.EXTRA_IS_SENSITIVE
+                                } else {
+                                    "android.content.extra.IS_SENSITIVE"
+                                }
+                                putBoolean(key, true)
+                            }
+                        }
                         clipboard.setPrimaryClip(clip)
                         scope.launch {
-                            snackbarHostState.showSnackbar("密钥文本已复制到剪贴板！")
+                            snackbarHostState.showSnackbar("密钥文本已安全复制到剪贴板！")
                         }
                     },
                     modifier = Modifier
@@ -285,7 +314,7 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                 }
             }
 
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.height(8.dp))
 
             Card(
                 colors = CardDefaults.cardColors(
@@ -300,11 +329,11 @@ fun PhoneTokenExportScreen(client: AppleLyricsClient) {
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.height(2.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         "1. 在手机上登录 Apple Music 账号；\n" +
-                        "2. 保持手表端“逐字歌词”处于打开状态；\n" +
-                        "3. 点击【一键发送密钥到手表】，手表将秒级自动接收并完成授权登录，无需繁琐输入！",
+                            "2. 确认手表已安装同一签名的 WristAM 并处于蓝牙/Wi-Fi 连接状态；\n" +
+                            "3. 点击【一键发送密钥到手表】，手表端收到后会立即用 KeyStore 加密保存并自动进入主界面。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

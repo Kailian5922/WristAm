@@ -1,22 +1,18 @@
 package com.applemusic.android.hls
 
+import java.net.URI
+
 /**
  * HLS（m3u8）解析 —— Apple Music 音频清单。
- *
- * 对应鸿蒙版 `HlsParser.ets`。Apple 的形态（实测）：
- *
- *   主清单：变体列表 + `#EXT-X-SESSION-KEY`（Widevine PSSH）
- *   子清单：`#EXT-X-KEY:METHOD=ISO-23001-7,URI="data:;base64,..."`
- *           `#EXT-X-MAP:URI="xxx.mp4",BYTERANGE="1006@0"`
- *           `#EXT-X-BYTERANGE:324055@1006`   ← 分片都在同一个 mp4 文件里
  */
 class HlsByteRange {
     var length = 0
     var offset = 0
+    var uri: String = ""
 }
 
 class HlsMediaInfo {
-    /** 密钥 URI（Apple 给的是 data:;base64,<16 字节 KID>） */
+    /** 密钥 URI（优先 Widevine：`data:;base64,...`） */
     var keyUri = ""
 
     /** 密钥方法（ISO-23001-7 = CENC） */
@@ -34,7 +30,7 @@ class HlsMediaInfo {
     /** 各分片的字节范围 */
     val segments = ArrayList<HlsByteRange>()
 
-    /** 清单所在目录（用于拼绝对地址） */
+    /** 清单所在基地址（用于解析相对/根相对/协议相对地址） */
     var baseUrl = ""
 }
 
@@ -48,23 +44,27 @@ class HlsMasterInfo {
 object HlsParser {
 
     private fun dirOf(url: String): String {
-        val i = url.lastIndexOf('/')
-        return if (i >= 0) url.substring(0, i + 1) else url
+        val clean = url.substringBefore('#').substringBefore('?')
+        val i = clean.lastIndexOf('/')
+        return if (i >= 0) clean.substring(0, i + 1) else clean
     }
 
     private fun abs(base: String, uri: String): String {
-        if (uri.startsWith("http://") || uri.startsWith("https://") || uri.startsWith("data:")) return uri
-        return base + uri
+        if (uri.isEmpty()) return uri
+        if (uri.startsWith("http://", ignoreCase = true) ||
+            uri.startsWith("https://", ignoreCase = true) ||
+            uri.startsWith("data:", ignoreCase = true) ||
+            uri.startsWith("skd://", ignoreCase = true)
+        ) {
+            return uri
+        }
+        return try {
+            URI(base).resolve(uri).toString()
+        } catch (_: Throwable) {
+            base + uri
+        }
     }
 
-    /**
-     * 解析 `#EXT-X-BYTERANGE:<长度>[@偏移]`。
-     *
-     * HLS 规范：**`@偏移` 可以省略**，省略时表示「紧接上一个 sub-range 之后」，
-     * 即 offset = 上一段的 offset + length。原项目在这里踩过一个大坑：省略时
-     * 默认成 0，导致同一清单里所有分片偏移都是 0 —— 整段拼装时后写的分片全部
-     * 覆盖在文件开头，下出来的文件完全是坏的（表现为「点了歌一直不播」）。
-     */
     private fun parseRange(s: String, prevEnd: Int): HlsByteRange {
         val r = HlsByteRange()
         val parts = s.split("@")
@@ -75,25 +75,26 @@ object HlsParser {
 
     private val uriRe = Regex("URI=\"([^\"]+)\"")
     private val keyFormatRe = Regex("KEYFORMAT=\"([^\"]+)\"")
+    private val methodRe = Regex("METHOD=([^,\\s]+)")
     private val byterangeRe = Regex("BYTERANGE=\"([^\"]+)\"")
 
     /** 解析主清单。 */
     fun parseMaster(text: String, url: String): HlsMasterInfo {
         val info = HlsMasterInfo()
         info.baseUrl = dirOf(url)
-        for (raw in text.split("\n")) {
+        for (raw in text.split('\n')) {
             val l = raw.trim()
             if (l.startsWith("#EXT-X-SESSION-KEY")) {
                 val m = uriRe.find(l) ?: continue
                 val uri = m.groupValues[1]
-                val fmt = keyFormatRe.find(l)
-                if (fmt != null && fmt.groupValues[1].contains("edef8ba9")) {
+                val fmt = keyFormatRe.find(l)?.groupValues?.get(1).orEmpty()
+                if (fmt.contains("edef8ba9", ignoreCase = true)) {
                     info.widevinePssh = uri
-                } else if (uri.startsWith("skd://")) {
+                } else if (uri.startsWith("skd://", ignoreCase = true)) {
                     info.skdUris.add(uri)
                 }
             } else if (l.isNotEmpty() && !l.startsWith("#")) {
-                info.variants.add(abs(info.baseUrl, l))
+                info.variants.add(abs(url, l))
             }
         }
         return info
@@ -104,21 +105,36 @@ object HlsParser {
         val info = HlsMediaInfo()
         info.baseUrl = dirOf(url)
         var pendingRange: HlsByteRange? = null
-        /** 上一段 byte-range 的结束位置（省略 @offset 时用它累加）。 */
         var prevEnd = 0
+        var hasPreferredWidevineKey = false
 
-        for (raw in text.split("\n")) {
+        for (raw in text.split('\n')) {
             val l = raw.trim()
             when {
-                l.startsWith("#EXT-X-KEY") -> {
-                    Regex("METHOD=([^,]+)").find(l)?.let { info.keyMethod = it.groupValues[1].trim() }
-                    uriRe.find(l)?.let { info.keyUri = it.groupValues[1] }
+                l.startsWith("#EXT-X-KEY:") -> {
+                    val method = methodRe.find(l)?.groupValues?.get(1)?.trim().orEmpty()
+                    val uri = uriRe.find(l)?.groupValues?.get(1).orEmpty()
+                    val fmt = keyFormatRe.find(l)?.groupValues?.get(1).orEmpty()
+                    if (method.equals("NONE", ignoreCase = true)) continue
+
+                    val isWidevine = fmt.contains("edef8ba9", ignoreCase = true) ||
+                        method.equals("ISO-23001-7", ignoreCase = true) ||
+                        uri.startsWith("data:", ignoreCase = true)
+                    // 优先锁定 Widevine/CENC 密钥，绝不被后续 FairPlay (skd://) 覆盖
+                    if (isWidevine) {
+                        info.keyMethod = method
+                        if (uri.isNotEmpty()) info.keyUri = uri
+                        hasPreferredWidevineKey = true
+                    } else if (!hasPreferredWidevineKey && info.keyUri.isEmpty()) {
+                        if (method.isNotEmpty()) info.keyMethod = method
+                        if (uri.isNotEmpty()) info.keyUri = uri
+                    }
                 }
 
-                l.startsWith("#EXT-X-MAP") -> {
+                l.startsWith("#EXT-X-MAP:") -> {
                     uriRe.find(l)?.let {
                         info.initUri = it.groupValues[1]
-                        info.mediaUri = it.groupValues[1]
+                        if (info.mediaUri.isEmpty()) info.mediaUri = it.groupValues[1]
                     }
                     byterangeRe.find(l)?.let {
                         info.initRange = parseRange(it.groupValues[1], 0)
@@ -126,22 +142,21 @@ object HlsParser {
                     }
                 }
 
-                l.startsWith("#EXT-X-BYTERANGE") -> {
+                l.startsWith("#EXT-X-BYTERANGE:") -> {
                     val v = l.substring("#EXT-X-BYTERANGE:".length)
                     pendingRange = parseRange(v, prevEnd)
                 }
 
                 l.isNotEmpty() && !l.startsWith("#") -> {
-                    // 媒体分片行
                     if (info.mediaUri.isEmpty()) info.mediaUri = l
                     val pr = pendingRange
                     if (pr != null) {
+                        pr.uri = l
                         info.segments.add(pr)
                         prevEnd = pr.offset + pr.length
                         pendingRange = null
                     } else {
-                        // 没有 byterange：整文件作为一个分片
-                        info.segments.add(HlsByteRange())
+                        info.segments.add(HlsByteRange().apply { uri = l })
                     }
                 }
             }
@@ -149,6 +164,6 @@ object HlsParser {
         return info
     }
 
-    /** 把相对 URI 拼成绝对地址。 */
+    /** 把相对 URI 解析成绝对地址。 */
     fun absolute(baseUrl: String, uri: String): String = abs(baseUrl, uri)
 }

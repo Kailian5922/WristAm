@@ -83,31 +83,60 @@ object CencDecryptor {
         if (moof.start != moofStart) return null
         val traf = Mp4.find(buf, "traf", moof.bodyStart, moof.bodyEnd) ?: return null
 
+        // ── tfhd / trex 缺省样本大小 ──
+        var defaultSampleSize = findTrexDefaultSampleSize(buf)
+        Mp4.find(buf, "tfhd", traf.bodyStart, traf.bodyEnd)?.let { tfhd ->
+            if (tfhd.bodyStart + 8 <= tfhd.bodyEnd) {
+                val tfFlags = (Mp4.u32(buf, tfhd.bodyStart) and 0xFFFFFFL).toInt()
+                var fp = tfhd.bodyStart + 8
+                if (tfFlags and 0x000001 != 0) fp += 8
+                if (tfFlags and 0x000002 != 0) fp += 4
+                if (tfFlags and 0x000008 != 0) fp += 4
+                if (tfFlags and 0x000010 != 0 && fp + 4 <= tfhd.bodyEnd) {
+                    defaultSampleSize = Mp4.u32(buf, fp).toInt()
+                }
+            }
+        }
+
         // ── trun：每个 sample 的大小 ──
         val trun = Mp4.find(buf, "trun", traf.bodyStart, traf.bodyEnd) ?: return null
         val info = FragmentInfo()
         info.moofStart = moof.start
 
         val tOff = trun.bodyStart
+        if (tOff + 8 > trun.bodyEnd) return null
         val tFlags = (Mp4.u32(buf, tOff) and 0xFFFFFFL).toInt()
         var p = tOff + 4
-        val sampleCount = Mp4.u32(buf, p).toInt()
+        val sampleCountLong = Mp4.u32(buf, p)
+        if (sampleCountLong > 2_000_000L) return null
+        val sampleCount = sampleCountLong.toInt()
         p += 4
 
         var dataOffsetRel = -1
         if (tFlags and 0x000001 != 0) {
+            if (p + 4 > trun.bodyEnd) return null
             dataOffsetRel = Mp4.i32(buf, p)
             p += 4
         }
         if (tFlags and 0x000004 != 0) {
+            if (p + 4 > trun.bodyEnd) return null
             p += 4 // first_sample_flags
         }
 
-        val sizes = ArrayList<Int>(sampleCount)
+        val perEntryBytes = (if (tFlags and 0x000100 != 0) 4 else 0) +
+            (if (tFlags and 0x000200 != 0) 4 else 0) +
+            (if (tFlags and 0x000400 != 0) 4 else 0) +
+            (if (tFlags and 0x000800 != 0) 4 else 0)
+        if (perEntryBytes > 0 && sampleCount.toLong() * perEntryBytes > (trun.bodyEnd - p).toLong()) {
+            return null
+        }
+
+        val sizes = ArrayList<Int>(sampleCount.coerceAtMost(16_384))
         for (i in 0 until sampleCount) {
-            var size = 0
+            var size = defaultSampleSize
             if (tFlags and 0x000100 != 0) p += 4 // sample_duration
             if (tFlags and 0x000200 != 0) {
+                if (p + 4 > trun.bodyEnd) break
                 size = Mp4.u32(buf, p).toInt()
                 p += 4
             }
@@ -120,26 +149,26 @@ object CencDecryptor {
         // ── senc：每个 sample 的 IV（+ 可选子样本表）──
         val senc = Mp4.find(buf, "senc", traf.bodyStart, traf.bodyEnd) ?: return null
         val sOff = senc.bodyStart
+        if (sOff + 8 > senc.bodyEnd) return null
         val sFlags = (Mp4.u32(buf, sOff) and 0xFFFFFFL).toInt()
         var sp = sOff + 4
-        val sencCount = Mp4.u32(buf, sp).toInt()
+        val sencCountLong = Mp4.u32(buf, sp)
+        if (sencCountLong > 2_000_000L) return null
+        val sencCount = sencCountLong.toInt()
         sp += 4
 
         val hasSubsample = (sFlags and 0x000002) != 0
         val ivSize: Int = if (hasSubsample) {
-            // 有 subsample 时必须靠 tenc 的 default_Per_Sample_IV_Size 才知道步长
             tencIvSize(buf)
         } else {
-            // 无 subsample：整块就是 count × ivSize，直接按剩余长度反推最稳
             val per = if (sencCount > 0) (senc.bodyEnd - sp) / sencCount else 0
             if (per == 8 || per == 16) per else tencIvSize(buf)
         }
 
         for (i in 0 until sencCount) {
+            if (sp + ivSize > senc.bodyEnd) break
             val iv = ByteArray(16)
-            if (sp + ivSize <= senc.bodyEnd) {
-                System.arraycopy(buf, sp, iv, 0, ivSize)
-            }
+            System.arraycopy(buf, sp, iv, 0, ivSize)
             sp += ivSize
             val subs = ArrayList<SubSample>()
             if (hasSubsample && sp + 2 <= senc.bodyEnd) {
@@ -149,7 +178,8 @@ object CencDecryptor {
                     if (sp + 6 > senc.bodyEnd) break
                     val ss = SubSample()
                     ss.clear = Mp4.u16(buf, sp)
-                    ss.encrypted = Mp4.u32(buf, sp + 2).toInt()
+                    val encLong = Mp4.u32(buf, sp + 2)
+                    ss.encrypted = if (encLong > Int.MAX_VALUE) 0 else encLong.toInt()
                     sp += 6
                     subs.add(ss)
                 }
@@ -186,25 +216,29 @@ object CencDecryptor {
         for (i in 0 until n) {
             val size = info.sizes[i]
             if (size <= 0) continue
-            if (cursor + size > buf.size) break
+            if (cursor < 0 || size > buf.size - cursor) break
             val iv = expandIv(info.ivs[i])
             val subs = info.subsamples.getOrNull(i) ?: emptyList()
             if (subs.isEmpty()) {
                 jobs.add(Job(cursor, size, iv))
             } else {
                 var inner = cursor
-                // 子样本口径的总长（clear + encrypted 累加），通常等于 sample size
                 var consumed = 0
+                val sampleEnd = cursor + size
                 for (ss in subs) {
-                    if (ss.encrypted > 0) {
-                        jobs.add(Job(inner + ss.clear, ss.encrypted, iv))
+                    val clear = ss.clear.coerceAtLeast(0)
+                    val enc = ss.encrypted.coerceAtLeast(0)
+                    if (clear > sampleEnd - inner) break
+                    val encStart = inner + clear
+                    val clampedEnc = enc.coerceAtMost(sampleEnd - encStart)
+                    if (clampedEnc > 0) {
+                        jobs.add(Job(encStart, clampedEnc, iv))
                     }
-                    inner += ss.clear + ss.encrypted
-                    consumed += ss.clear + ss.encrypted
+                    inner = encStart + clampedEnc
+                    consumed = inner - cursor
                 }
-                // 子样本表没铺满 sample 时，剩余部分按密文处理（防御性）
-                if (consumed < size) {
-                    jobs.add(Job(inner, size - consumed, iv))
+                if (consumed < size && inner < sampleEnd) {
+                    jobs.add(Job(inner, sampleEnd - inner, iv))
                 }
             }
             cursor += size
@@ -226,6 +260,7 @@ object CencDecryptor {
         val futures = ArrayList<Future<*>>(activeWorkers)
         for (w in 0 until activeWorkers) {
             val from = w * chunk
+            if (from >= jobs.size) break
             val to = minOf(from + chunk, jobs.size)
             futures.add(decryptExecutor.submit {
                 val decryptor = AesCtr.Decryptor(key)
@@ -273,18 +308,39 @@ object CencDecryptor {
     }
 
     /**
-     * 读 init segment 里 tenc 盒子的 default_Per_Sample_IV_Size（偏移 3）。
+     * 读 moov/mvex/trex 的 default_sample_size（供缺少 0x200 的 trun 兜底）。
+     */
+    private fun findTrexDefaultSampleSize(buf: ByteArray): Int {
+        val moov = Mp4.findTop(buf, "moov") ?: return 0
+        val mvex = Mp4.find(buf, "mvex", moov.bodyStart, moov.bodyEnd) ?: return 0
+        val trex = Mp4.find(buf, "trex", mvex.bodyStart, mvex.bodyEnd) ?: return 0
+        if (trex.bodyStart + 20 > trex.bodyEnd) return 0
+        return Mp4.u32(buf, trex.bodyStart + 16).toInt()
+    }
+
+    /**
+     * 读 moov 内 tenc FullBox 的 default_Per_Sample_IV_Size（body 偏移 7）。
      *
-     * tenc body: reserved(1) crypt/skip(1) isProtected(1) ivSize(1) KID(16)
-     * 取不到时返回 8（Apple HLS 的实测值）。
+     * tenc FullBox body: version(1) flags(3) reserved(1) crypt/skip(1) isProtected(1) ivSize(1) KID(16)
+     * 仅在 moov 内搜索，避免扫到 mdat 里的巧合字节；取不到时回退 8（Apple HLS 常见值）。
      */
     private fun tencIvSize(buf: ByteArray): Int {
-        val idx = Mp4.indexOf(buf, "tenc", 0)
-        if (idx < 4) return 8
-        val body = idx + 4
-        if (body + 4 > buf.size) return 8
-        val size = buf[body + 3].toInt() and 0xFF
-        return if (size == 8 || size == 16) size else 8
+        val moov = Mp4.findTop(buf, "moov") ?: return 8
+        val end = moov.bodyEnd
+        var i = moov.bodyStart
+        while (i + 12 <= end) {
+            if (buf[i] == 't'.code.toByte() && buf[i + 1] == 'e'.code.toByte() &&
+                buf[i + 2] == 'n'.code.toByte() && buf[i + 3] == 'c'.code.toByte()
+            ) {
+                val body = i + 4
+                if (body + 8 <= end) {
+                    val size = buf[body + 7].toInt() and 0xFF
+                    if (size == 8 || size == 16) return size
+                }
+            }
+            i++
+        }
+        return 8
     }
 
     /** senc 里的 IV → 128 位 CTR 计数器（前 8 字节 + 8 个 0）。 */

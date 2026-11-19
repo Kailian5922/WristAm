@@ -82,37 +82,32 @@ object Mp4Cleaner {
      * 这里把它规整成 1（`stsd` 里只有一个采样条目）；duration 若为非法值也一并给个合理默认。
      */
     fun normalizeTrex(data: ByteArray): ByteArray {
-        val out = data.copyOf()
+        val moov = Mp4.findTop(data, "moov") ?: return data
+        val mvex = Mp4.find(data, "mvex", moov.bodyStart, moov.bodyEnd) ?: return data
+        var out: ByteArray? = null
         var fixed = 0
-        var searchFrom = 0
-        val ascii = String(out, Charsets.ISO_8859_1)
-        while (true) {
-            val typePos = ascii.indexOf("trex", searchFrom)
-            if (typePos < 4) break
-            searchFrom = typePos + 1
-            val boxStart = typePos - 4
-            val size = be32(out, boxStart)
-            if (size < 32 || boxStart + size > out.size) continue
-            // trex: boxStart+0 size, +4 type, +8 ver/flags, +12 track_ID,
-            //       +16 desc_idx, +20 duration, +24 size, +28 flags
-            val descIdx = be32(out, boxStart + 16)
-            if (descIdx < 1) {
-                setBoxSizeAt(out, boxStart + 16, 1)
-                fixed++
-                Logx.i(TAG, "trex@$boxStart 的 default_sample_description_index $descIdx -> 1")
-            }
-            val duration = be32(out, boxStart + 20)
-            if (duration <= 0) {
-                // 给一个常见 AAC 帧时长（1024 采样 @48kHz ≈ 21333us 的近似值），
-                // 真实时长以 trun/tfhd 为准，这里只是避免非法值。
-                setBoxSizeAt(out, boxStart + 20, 1024)
-                fixed++
-                Logx.i(TAG, "trex@$boxStart 的 default_sample_duration $duration -> 1024")
+        for (trex in Mp4.boxes(data, mvex.bodyStart, mvex.bodyEnd)) {
+            if (trex.type != "trex" || trex.size < 32 || trex.start + 32 > data.size) continue
+            val boxStart = trex.start
+            val descIdx = be32(data, boxStart + 16)
+            val duration = be32(data, boxStart + 20)
+            if (descIdx < 1 || duration <= 0) {
+                val target = out ?: data.copyOf().also { out = it }
+                if (descIdx < 1) {
+                    setBoxSizeAt(target, boxStart + 16, 1)
+                    fixed++
+                    Logx.i(TAG, "trex@$boxStart 的 default_sample_description_index $descIdx -> 1")
+                }
+                if (duration <= 0) {
+                    setBoxSizeAt(target, boxStart + 20, 1024)
+                    fixed++
+                    Logx.i(TAG, "trex@$boxStart 的 default_sample_duration $duration -> 1024")
+                }
             }
         }
         if (fixed == 0) return data
         Logx.i(TAG, "normalizeTrex: 修了 $fixed 个字段")
-        return out
+        return out ?: data
     }
 
     private fun setBoxSizeAt(d: ByteArray, off: Int, v: Int) {
@@ -170,9 +165,12 @@ object Mp4Cleaner {
      */
     fun stripSampleEntryEncryption(data: ByteArray): ByteArray {
         if (data.size < 16) return data
-        val ascii = String(data, Charsets.ISO_8859_1)
+        // 严格限定在 moov 切片内扫描，杜绝把整首 10~20MB mdat 转成 String 引发手表 OOM 或误改音频
+        val moovBox = Mp4.findTop(data, "moov") ?: return data
+        val moovSlice = data.copyOfRange(moovBox.start, moovBox.bodyEnd)
+        val ascii = String(moovSlice, Charsets.ISO_8859_1)
 
-        // 找出所有 sinf 的「类型字段」位置（长度字段在它前面 4 字节）
+        // 找出 moov 内所有 sinf 的「类型字段」位置（长度字段在它前面 4 字节）
         val sinfPositions = ArrayList<Int>(4)
         var searchFrom = 0
         while (true) {
@@ -186,11 +184,7 @@ object Mp4Cleaner {
             return data
         }
 
-        // 记录所有祖先 box 的**长度字段偏移**，稍后统一减去删掉的字节数。
-        // 【关键】只改采样条目自己的长度是不够的 —— `stsd`/`stbl`/`minf`/`mdia`/`trak`/`moov`
-        // 每一层都写着长度，少改了就会让 moov 多吃掉后面 moof 的头部，
-        // ExoPlayer 会直接报 `ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE`。
-        val ancestors = collectSizeFieldOffsets(data)
+        val ancestors = collectSizeFieldOffsets(moovSlice)
 
         val chunks = ArrayList<ByteArray>(8)
         var copiedUpTo = 0
@@ -199,84 +193,80 @@ object Mp4Cleaner {
 
         for (pos in sinfPositions) {
             if (pos < 4) continue
-            val sinfSize = be32(data, pos - 4)
+            val sinfSize = be32(moovSlice, pos - 4)
             if (sinfSize < 16) continue
             val sinfStart = pos - 4
             val sinfEnd = sinfStart + sinfSize
-            if (sinfEnd > data.size) continue
-            // 第一个子 box 必须是 frma / schm，确认这是真的 DRM 标识
-            if (pos + 12 > data.size) continue
+            if (sinfEnd > moovSlice.size) continue
+            if (pos + 12 > moovSlice.size) continue
             val firstChild = ascii.substring(pos + 8, pos + 12)
             if (firstChild != "frma" && firstChild != "schm") continue
 
             val h = findSampleEntryStart(ascii, sinfStart)
-            if (h < 0) {
-                Logx.w(TAG, "sinf@$pos 找不到对应的 enca 条目头，跳过")
+            if (h < 0 || h < copiedUpTo) {
+                Logx.w(TAG, "sinf@$pos 找不到有效 enca 条目头，跳过")
                 continue
             }
-            val eSize = be32(data, h)
+            val eSize = be32(moovSlice, h)
             val eEnd = h + eSize
-            if (eEnd > data.size) continue
+            if (eSize <= sinfSize || eEnd > moovSlice.size) continue
 
-            // 采样条目里 frma 的内容 4 字节 = 原始格式（通常是 mp4a）
+            // frma 必须在当前 sinf 范围内
             val frmaPos = ascii.indexOf("frma", pos)
-            if (frmaPos < 0 || frmaPos + 8 > data.size) continue
+            if (frmaPos < 0 || frmaPos + 8 > sinfEnd) continue
             val orig = ascii.substring(frmaPos + 4, frmaPos + 8)
             if (orig.length != 4) continue
 
-            chunks.add(data.copyOfRange(copiedUpTo, h))
-            val entry = data.copyOfRange(h, eEnd)
+            chunks.add(moovSlice.copyOfRange(copiedUpTo, h))
+            val entry = moovSlice.copyOfRange(h, eEnd)
             val rel = sinfStart - h
             val sinfEndInEntry = rel + sinfSize
             val tailLen = maxOf(0, entry.size - sinfEndInEntry)
-            val out = ByteArray(entry.size - sinfSize)
+            val outEntry = ByteArray(entry.size - sinfSize)
             if (tailLen > 0) {
-                System.arraycopy(entry, entry.size - tailLen, out, out.size - tailLen, tailLen)
+                System.arraycopy(entry, entry.size - tailLen, outEntry, outEntry.size - tailLen, tailLen)
             }
             if (rel > 0) {
-                System.arraycopy(entry, 0, out, 0, minOf(rel, out.size))
+                System.arraycopy(entry, 0, outEntry, 0, minOf(rel, outEntry.size))
             }
-            for (k in 0 until 4) out[4 + k] = orig[k].code.toByte()
-            setBoxSize(out, out.size)
-            chunks.add(out)
+            for (k in 0 until 4) outEntry[4 + k] = orig[k].code.toByte()
+            setBoxSize(outEntry, outEntry.size)
+            chunks.add(outEntry)
             copiedUpTo = eEnd
             handled++
             removedTotal += sinfSize
-            Logx.i(TAG, "采样条目 enca@$h -> $orig，删 sinf(${sinfSize}B)：$eSize -> ${out.size}")
+            Logx.i(TAG, "采样条目 enca@$h -> $orig，删 sinf(${sinfSize}B)：$eSize -> ${outEntry.size}")
         }
 
         if (handled == 0) {
             Logx.w(TAG, "stripSampleEntryEncryption: 认到了 sinf 但没能清理，文件原样返回")
             return data
         }
-        chunks.add(data.copyOfRange(copiedUpTo, data.size))
-        val out = concat(*chunks.toTypedArray())
+        chunks.add(moovSlice.copyOfRange(copiedUpTo, moovSlice.size))
+        val newMoov = concatList(chunks)
 
-        // 沿**祖先链**把每一层的长度都减掉。
-        // 【易错点，真机踩过】必须只减 stsd 及其父容器（moov→trak→mdia→minf→stbl→stsd）
-        // 的长度。早期版本收集了 moov 里**所有** box 的偏移并统统减 80，
-        // 结果把 mvhd / tkhd / mdat 这些无关 box 的长度也改小了 80 ——
-        // 文件顶层看着连续（总长对），但 ffprobe 报
-        // `overread end of atom 'mvhd' by 80 bytes`，所有播放器都打不开。
         var patched = 0
-        Logx.i(TAG, "祖先链偏移 = $ancestors（removedTotal=$removedTotal handled=$handled）")
         for (off in ancestors) {
-            if (off < 0 || off + 4 > out.size) {
-                Logx.w(TAG, "  祖先 @$off 越界（out=${out.size}），跳过")
-                continue
-            }
-            val old = be32(out, off)
-            if (old < 8) {
-                Logx.w(TAG, "  祖先 @$off 的长度字段非法（$old），跳过")
-                continue
-            }
-            setBoxSize(out, off, old - removedTotal)
+            if (off < 0 || off + 4 > newMoov.size) continue
+            val old = be32(newMoov, off)
+            if (old < 8 + removedTotal) continue
+            setBoxSize(newMoov, off, old - removedTotal)
             patched++
+        }
+
+        val out = ByteArray(data.size - moovSlice.size + newMoov.size)
+        if (moovBox.start > 0) {
+            System.arraycopy(data, 0, out, 0, moovBox.start)
+        }
+        System.arraycopy(newMoov, 0, out, moovBox.start, newMoov.size)
+        val tailStart = moovBox.bodyEnd
+        if (tailStart < data.size) {
+            System.arraycopy(data, tailStart, out, moovBox.start + newMoov.size, data.size - tailStart)
         }
         Logx.i(
             TAG,
             "stripSampleEntryEncryption: ${data.size} -> ${out.size}（处理 $handled 处，删 $removedTotal B，" +
-                    "修补 $patched 层祖先长度）"
+                "修补 $patched 层祖先长度）"
         )
         return out
     }
@@ -316,12 +306,14 @@ object Mp4Cleaner {
         var removedCount = 0
         var fixedOffsets = 0
 
-        // 预计算每个 moof 后面那个 mdat 的头长度
+        // 预计算每个 moof 后面那个 mdat 的实际头长度（8 或 largesize 16）
         val mdatHeader = IntArray(top.size) { 8 }
         for (i in top.indices) {
             if (top[i].type != "moof") continue
             val next = top.getOrNull(i + 1)
-            if (next != null && next.type == "mdat" && next.size == 1) mdatHeader[i] = 16
+            if (next != null && next.type == "mdat") {
+                mdatHeader[i] = (next.bodyStart - next.start).coerceAtLeast(8)
+            }
         }
 
         for ((bi, b) in top.withIndex()) {
@@ -362,9 +354,9 @@ object Mp4Cleaner {
             if (moofChanged) {
                 changed = true
                 val newMoof = makeBox("moof", concatList(moofParts))
-                // moof 变短了，data_offset 必须按新布局重算
-                val want = newMoof.size + mdatHeader[bi]
-                if (retargetTrunDataOffset(newMoof, want)) fixedOffsets++
+                val shrinkDelta = b.size - newMoof.size
+                val minWant = newMoof.size + mdatHeader[bi]
+                if (retargetTrunDataOffset(newMoof, shrinkDelta, minWant)) fixedOffsets++
                 parts.add(newMoof)
             } else {
                 parts.add(data.copyOfRange(b.start, b.bodyEnd))
@@ -382,10 +374,9 @@ object Mp4Cleaner {
     }
 
     /**
-     * 把 `moof` 里所有 `trun` 的 `data_offset` 改成 [want]（相对 moof 起点）。
-     * 只处理带 `data_offset`（flags & 0x1）的 trun；其余保持原样。
+     * 按 moof 缩短量 [shrinkDelta] 精确修正每个 `trun` 的 `data_offset`（保留多 trun 相对偏移）。
      */
-    private fun retargetTrunDataOffset(moof: ByteArray, want: Int): Boolean {
+    private fun retargetTrunDataOffset(moof: ByteArray, shrinkDelta: Int, minWant: Int): Boolean {
         var fixed = false
         var off = 8
         while (off + 8 <= moof.size) {
@@ -398,8 +389,10 @@ object Mp4Cleaner {
                     if (cs < 8 || c + cs > off + size) break
                     if (String(moof, c + 4, 4, Charsets.ISO_8859_1) == "trun") {
                         val flags = (be32(moof, c + 8) and 0xFFFFFF)
-                        if (flags and 0x000001 != 0 && c + 16 <= moof.size) {
-                            setBoxSize(moof, c + 16, want)
+                        if (flags and 0x000001 != 0 && c + 20 <= off + size) {
+                            val oldOffset = be32(moof, c + 16)
+                            val adjusted = oldOffset - shrinkDelta
+                            setBoxSize(moof, c + 16, if (adjusted >= minWant) adjusted else minWant)
                             fixed = true
                         }
                     }

@@ -9,11 +9,27 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.applemusic.lyricstool.wear"
+        // 与 :phone 伴侣端保持完全一致的 applicationId，Google Play Services Wearable Data Layer 才能正常互通
+        applicationId = "com.applemusic.lyricstool"
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+    }
+
+    signingConfigs {
+        val ksPath = System.getenv("KEYSTORE_PATH")
+        val ksPass = System.getenv("KEYSTORE_PASSWORD")
+        val kAlias = System.getenv("KEY_ALIAS")
+        val kPass = System.getenv("KEY_PASSWORD")
+        if (!ksPath.isNullOrBlank() && !ksPass.isNullOrBlank() && !kAlias.isNullOrBlank() && !kPass.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = ksPass
+                keyAlias = kAlias
+                keyPassword = kPass
+            }
+        }
     }
 
     compileOptions {
@@ -37,7 +53,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 }
@@ -49,6 +65,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.4")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("androidx.media3:media3-exoplayer:1.4.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
     implementation("androidx.media3:media3-session:1.4.1")
@@ -64,6 +82,7 @@ dependencies {
     implementation("androidx.wear.compose:compose-foundation:1.5.0-alpha08")
     implementation("androidx.wear.compose:compose-material-core:1.5.0-alpha08")
     implementation("androidx.wear.compose:compose-material3:1.0.0-alpha31")
+    implementation("androidx.wear.compose:compose-navigation:1.5.0-alpha08")
     implementation("androidx.graphics:graphics-shapes:1.0.1")
     implementation("androidx.palette:palette-ktx:1.0.0")
     implementation("com.google.android.gms:play-services-wearable:18.2.0")

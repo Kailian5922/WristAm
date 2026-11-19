@@ -42,7 +42,8 @@ object Mp4 {
             val type = fourcc(d, off + 4)
             var headerLen = 8
             if (boxSize == 1L) {
-                // 64 位长度：size 字段本身变成 16 字节
+                // 64 位长度：size 字段本身变成 16 字节，必须先检查边界防越界
+                if (off + 16 > end) break
                 boxSize = u64(d, off + 8)
                 headerLen = 16
             } else if (boxSize == 0L) {
@@ -50,7 +51,7 @@ object Mp4 {
                 boxSize = (end - off).toLong()
             }
             if (boxSize < headerLen) break
-            if (off + boxSize > end) break
+            if (boxSize > (end - off).toLong()) break
 
             val b = Box()
             b.type = type

@@ -22,44 +22,57 @@ class WvdKeyFetcher(
 
     override val name: String = "内置 WVD 凭证"
 
-    private val cdm: WidevineCdm by lazy {
-        val dev: WvdDevice = WvdDevice.parseBuiltin()
-        Logx.i(TAG, "内置 CDM 就绪: type=${dev.type} level=${dev.securityLevel} rsa=${dev.rsaBits} " +
-                "clientId=${dev.clientId.size}B")
-        WidevineCdm(dev)
-    }
-
     override fun fetchKey(keyUri: String, adamId: String, licenseServer: String): ByteArray {
+        val cdm = sharedCdm
         val pssh = Pssh.payloadFromKeyUri(keyUri)
         val challenge = cdm.buildChallenge(pssh, 1)
-        val challengeB64 = Base64.encodeToString(challenge, Base64.NO_WRAP)
+        var consumed = false
+        try {
+            val challengeB64 = Base64.encodeToString(challenge, Base64.NO_WRAP)
 
-        val o = org.json.JSONObject()
-        o.put("challenge", challengeB64)
-        o.put("key-system", "com.widevine.alpha")
-        o.put("uri", keyUri)
-        o.put("adamId", adamId)
-        o.put("isLibrary", false)
-        o.put("user-initiated", true)
-        val respText = postLicense(o.toString())
+            val o = org.json.JSONObject()
+            o.put("challenge", challengeB64)
+            o.put("key-system", "com.widevine.alpha")
+            o.put("uri", keyUri)
+            o.put("adamId", adamId)
+            o.put("isLibrary", false)
+            o.put("user-initiated", true)
+            val respText = postLicense(o.toString())
 
-        val licB64 = try {
-            org.json.JSONObject(respText).optString("license", "")
-        } catch (t: Throwable) {
-            ""
+            val licB64 = try {
+                org.json.JSONObject(respText).optString("license", "")
+            } catch (_: Throwable) {
+                ""
+            }
+            if (licB64.isEmpty()) {
+                throw IllegalStateException("license 响应异常: ${respText.take(200)}")
+            }
+            val licBytes = Base64.decode(licB64, Base64.DEFAULT)
+            consumed = true
+            val keys = cdm.parseLicense(licBytes)
+            val content = cdm.contentKeys(keys)
+            if (content.isEmpty()) throw IllegalStateException("license 里没有 CONTENT 类型的密钥")
+            Logx.i(TAG, "内容密钥 (${content[0].key.size}B) 获取成功，debug=${cdm.lastDebug}")
+            return content[0].key
+        } finally {
+            if (!consumed) {
+                cdm.discardChallenge(challenge)
+            }
         }
-        if (licB64.isEmpty()) {
-            throw IllegalStateException("license 响应异常: ${respText.take(200)}")
-        }
-        val licBytes = Base64.decode(licB64, Base64.DEFAULT)
-        val keys = cdm.parseLicense(licBytes)
-        val content = cdm.contentKeys(keys)
-        if (content.isEmpty()) throw IllegalStateException("license 里没有 CONTENT 类型的密钥")
-        Logx.i(TAG, "内容密钥 (${content[0].key.size}B) 获取成功，debug=${cdm.lastDebug}")
-        return content[0].key
     }
 
     companion object {
         private const val TAG = "WvdKey"
+
+        /** 全局复用解析好的内置 WVD 设备与 RSA 私钥，避免每首歌重复解码与建钥。 */
+        private val sharedCdm: WidevineCdm by lazy {
+            val dev: WvdDevice = WvdDevice.parseBuiltin()
+            Logx.i(
+                TAG,
+                "内置 CDM 就绪: type=${dev.type} level=${dev.securityLevel} rsa=${dev.rsaBits} " +
+                    "clientId=${dev.clientId.size}B"
+            )
+            WidevineCdm(dev)
+        }
     }
 }

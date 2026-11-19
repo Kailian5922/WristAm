@@ -17,6 +17,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.applemusic.android.apple.MusicRepository
 import com.applemusic.android.lyrics.Lyrics
 import com.applemusic.android.util.ImageLoader
 import com.applemusic.lyricstool.data.AppleLyricsClient
@@ -30,7 +32,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
-import java.lang.reflect.InvocationTargetException
 
 object LiveLyricsNotification {
     private const val TAG = "LiveLyricsNotification"
@@ -41,9 +42,15 @@ object LiveLyricsNotification {
 
     private val handler = Handler(Looper.getMainLooper())
     private val lyricsScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile private var started = false
     @Volatile private var lyricsSongId: String? = null
     @Volatile private var lyrics: Lyrics? = null
     @Volatile private var enabled = true
+    @Volatile private var lastSignature: String? = null
+    @Volatile private var artworkBitmap: Bitmap? = null
+    @Volatile private var artworkIconBitmap: Bitmap? = null
+
     private var appContext: Context? = null
     private var appleLyricsClient: AppleLyricsClient? = null
     private val qqLyricsClient = QQMusicLyricsClient()
@@ -51,16 +58,19 @@ object LiveLyricsNotification {
     private var lyricsRequestJob: Job? = null
     private var requestedLyricsSongId: String? = null
     private var lyricsRequestStartedAtMs = 0L
-    private var lastSignature: String? = null
-    private var lastPromotionStatus: String? = null
     private var requestedArtworkUrl: String? = null
-    @Volatile private var artworkBitmap: Bitmap? = null
-    @Volatile private var artworkIconBitmap: Bitmap? = null
+
+    private val playbackListener: () -> Unit = {
+        handler.post { refreshScheduleAndUpdate() }
+    }
 
     private val updateTask = object : Runnable {
         override fun run() {
+            if (!started) return
             updateNotification()
-            handler.postDelayed(this, UPDATE_INTERVAL_MS)
+            if (started && enabled && PlaybackEngine.isPlaying()) {
+                handler.postDelayed(this, UPDATE_INTERVAL_MS)
+            }
         }
     }
 
@@ -71,8 +81,19 @@ object LiveLyricsNotification {
         enabled = context.getSharedPreferences("lyrics_appearance", Context.MODE_PRIVATE)
             .getBoolean("status_bar_lyrics_enabled", true)
         createChannel(context.applicationContext)
+        started = true
+        PlaybackEngine.addStateListener(playbackListener)
+        handler.post { refreshScheduleAndUpdate() }
+    }
+
+    fun stop() {
+        started = false
+        PlaybackEngine.removeStateListener(playbackListener)
         handler.removeCallbacks(updateTask)
-        handler.post(updateTask)
+        lyricsRequestJob?.cancel()
+        lyricsRequestJob = null
+        lastSignature = null
+        appContext?.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
     }
 
     fun setEnabled(context: Context, value: Boolean) {
@@ -82,7 +103,7 @@ object LiveLyricsNotification {
             .edit()
             .putBoolean("status_bar_lyrics_enabled", value)
             .apply()
-        handler.post { updateNotification() }
+        handler.post { refreshScheduleAndUpdate() }
     }
 
     fun setLyrics(songId: String, value: Lyrics?) {
@@ -94,12 +115,21 @@ object LiveLyricsNotification {
             lyricsRequestStartedAtMs = System.currentTimeMillis()
         }
         lastSignature = null
-        handler.post { updateNotification() }
+        handler.post { refreshScheduleAndUpdate() }
+    }
+
+    private fun refreshScheduleAndUpdate() {
+        handler.removeCallbacks(updateTask)
+        if (!started) return
+        updateNotification()
+        if (enabled && PlaybackEngine.isPlaying()) {
+            handler.postDelayed(updateTask, UPDATE_INTERVAL_MS)
+        }
     }
 
     private fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val manager = context.getSystemService(NotificationManager::class.java)
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL_ID) == null) {
             manager.createNotificationChannel(
                 NotificationChannel(
@@ -119,27 +149,29 @@ object LiveLyricsNotification {
 
     private fun updateNotification() {
         val context = appContext ?: return
-        val manager = context.getSystemService(NotificationManager::class.java)
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
         if (!enabled) {
-            manager.cancel(NOTIFICATION_ID)
-            lastSignature = null
+            if (lastSignature != null) {
+                manager.cancel(NOTIFICATION_ID)
+                lastSignature = null
+            }
             return
         }
-        if (!manager.areNotificationsEnabled()) {
-            Log.w(TAG, "Notifications are disabled for this app")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !manager.areNotificationsEnabled()) {
             return
         }
         val song = PlaybackEngine.currentSong()
         val player = PlaybackEngine.player
-
         if (song == null || player == null || !PlaybackEngine.isPlaying()) {
-            manager.cancel(NOTIFICATION_ID)
-            lastSignature = null
+            if (lastSignature != null) {
+                manager.cancel(NOTIFICATION_ID)
+                lastSignature = null
+            }
             return
         }
 
-        val songId = song.appleId.ifBlank {
-            song.catalogId.ifBlank { song.uri.removePrefix("apple:") }
+        val songId = song.catalogId.ifBlank {
+            song.appleId.ifBlank { song.uri.removePrefix("apple:") }
         }
         val currentLyrics = lyrics?.takeIf { lyricsSongId == songId }
         if (currentLyrics == null && songId.isNotBlank()) {
@@ -156,7 +188,7 @@ object LiveLyricsNotification {
                         artworkBitmap = bitmap
                         artworkIconBitmap = bitmap?.let(::createCircularArtworkIcon)
                         lastSignature = null
-                        updateNotification()
+                        handler.post { updateNotification() }
                     }
                 }
             }
@@ -167,8 +199,7 @@ object LiveLyricsNotification {
         }
         val lyricText = currentLine?.text?.takeIf { it.isNotBlank() } ?: "正在获取歌词…"
         val translationText = currentLine?.translation?.takeIf { it.isNotBlank() }
-        val signature =
-            "$songId|$lyricText|$translationText|$artworkUrl|${artworkBitmap != null}"
+        val signature = "$songId|$lyricText|$translationText|$artworkUrl|${artworkBitmap != null}"
         if (signature == lastSignature) return
         lastSignature = signature
 
@@ -178,51 +209,79 @@ object LiveLyricsNotification {
                 action = PlaybackEngine.ACTION_OPEN_NOW_PLAYING
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             }
-            ?: Intent(context, MusicService::class.java)
-                .setAction(PlaybackEngine.ACTION_OPEN_NOW_PLAYING)
-        val contentIntent = PendingIntent.getActivity(
-            context,
-            NOTIFICATION_ID,
-            launchIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val contentIntent = launchIntent?.let {
+            PendingIntent.getActivity(
+                context,
+                NOTIFICATION_ID,
+                it,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
         val fallbackResId = context.resources.getIdentifier(
             "ic_notification_transparent",
             "drawable",
             context.packageName
         ).let { if (it != 0) it else android.R.drawable.ic_media_play }
-        val builder = Notification.Builder(context, CHANNEL_ID)
-            .setSmallIcon(
-                artworkIconBitmap?.let { Icon.createWithBitmap(it) }
-                    ?: Icon.createWithResource(context, fallbackResId)
-            )
-            .setWhen(System.currentTimeMillis())
-            .setCategory(Notification.CATEGORY_STATUS)
-            .setPriority(Notification.PRIORITY_HIGH)
-            .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setContentIntent(contentIntent)
-            .setContentTitle(lyricText)
-            .setSubText(null)
-            .setContentText(translationText)
-            .setShortCriticalText(lyricText.take(12))
-            .setLargeIcon(artworkBitmap)
 
-        requestPromotion(builder)
-        val notification = builder.build()
-        val promotable = notification.hasPromotableCharacteristics()
-        val promotionAllowed = manager.canPostPromotedNotifications()
-        val promotionStatus =
-            "promotable=$promotable, promotionAllowed=$promotionAllowed, flags=${notification.flags}"
-        if (promotionStatus != lastPromotionStatus) {
-            Log.i(TAG, "Live Update eligibility: $promotionStatus")
-            lastPromotionStatus = promotionStatus
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val builder = Notification.Builder(context, CHANNEL_ID)
+                .setSmallIcon(
+                    artworkIconBitmap?.let { Icon.createWithBitmap(it) }
+                        ?: Icon.createWithResource(context, fallbackResId)
+                )
+                .setWhen(System.currentTimeMillis())
+                .setCategory(Notification.CATEGORY_STATUS)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentTitle(lyricText)
+                .setSubText(null)
+                .setContentText(translationText)
+                .setLargeIcon(artworkBitmap)
+            if (contentIntent != null) builder.setContentIntent(contentIntent)
+            // Android 16 (API 36) Live Update 特性严格做版本保护，避免低版本 NoSuchMethodError 崩溃
+            if (Build.VERSION.SDK_INT >= 36) {
+                applyApi36LiveUpdate(builder, lyricText.take(12))
+            }
+            builder.build()
+        } else {
+            NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(fallbackResId)
+                .setWhen(System.currentTimeMillis())
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentTitle(lyricText)
+                .setContentText(translationText)
+                .setLargeIcon(artworkBitmap)
+                .apply { if (contentIntent != null) setContentIntent(contentIntent) }
+                .build()
         }
-        manager.notify(NOTIFICATION_ID, notification)
+
+        try {
+            manager.notify(NOTIFICATION_ID, notification)
+        } catch (t: Throwable) {
+            Log.w(TAG, "投递状态栏歌词通知失败: ${t.message}")
+        }
     }
 
-    private fun createCircularArtworkIcon(source: Bitmap): Bitmap {
+    private fun applyApi36LiveUpdate(builder: Notification.Builder, shortText: String) {
+        try {
+            builder.javaClass
+                .getMethod("setShortCriticalText", CharSequence::class.java)
+                .invoke(builder, shortText)
+            builder.javaClass
+                .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
+                .invoke(builder, true)
+        } catch (_: Throwable) {
+            // 某些预览版/ROM 可能未暴露此 API，安全降级
+        }
+    }
+
+    private fun createCircularArtworkIcon(source: Bitmap): Bitmap? {
+        if (source.width <= 0 || source.height <= 0 || source.isRecycled) return null
         val size = 96
         val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
@@ -262,15 +321,17 @@ object LiveLyricsNotification {
             artist = song.artist,
             album = song.album,
             artworkUrl = song.coverUrl,
-            durationMs = song.durationMs
+            durationMs = song.durationMs,
+            providerSongId = song.catalogId.takeIf { it.isNotBlank() },
+            isrc = song.isrc.takeIf { it.isNotBlank() }
         )
         lyricsRequestJob = lyricsScope.launch {
             try {
                 appleClient.reloadSavedSession()
                 val fetched = fetchLyrics(appleClient, cache, songHit)
                 val currentSong = PlaybackEngine.currentSong()
-                val currentSongId = currentSong?.appleId
-                    ?.ifBlank { currentSong.catalogId }
+                val currentSongId = currentSong?.catalogId
+                    ?.ifBlank { currentSong.appleId }
                     ?.ifBlank { currentSong.uri.removePrefix("apple:") }
                 if (currentSongId == songId && fetched != null) {
                     lyricsSongId = songId
@@ -291,19 +352,36 @@ object LiveLyricsNotification {
         cache: LyricsCache,
         song: SongHit
     ): FetchedLyrics? {
-        val appleLyrics = cache.get("apple", song.id)
-            ?: appleClient.fetchLyrics(song.id)?.also { cache.put("apple", song.id, it) }
+        val resolvedCatalogId = song.providerSongId?.takeIf { it.isNotBlank() && !it.startsWith("i.") }
+            ?: song.id.takeUnless { it.startsWith("i.") }
+            ?: if (MusicRepository.isInitialized()) {
+                MusicRepository.api.librarySongCatalogId(song.id).takeIf { it.isNotBlank() }
+            } else {
+                null
+            }
+        val cacheKeyId = resolvedCatalogId ?: song.id
+
+        val appleCached = cache.get("apple", cacheKeyId)
+        if ((appleCached?.lyrics?.wordTimedLines() ?: 0) > 0) return appleCached
+        val qqCached = cache.get("qq", cacheKeyId)
+        if (qqCached != null) return qqCached
+
+        val appleLyrics = appleCached ?: resolvedCatalogId?.let { cid ->
+            try {
+                appleClient.fetchLyrics(cid)?.also { cache.put("apple", cacheKeyId, it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
         if ((appleLyrics?.lyrics?.wordTimedLines() ?: 0) > 0) return appleLyrics
 
-        val cachedQqLyrics = cache.get("qq", song.id)
-        if (cachedQqLyrics != null) return cachedQqLyrics
-        var metadataError: Exception? = null
         val localizedMetadata = try {
             appleClient.fetchChineseSongMetadata(song)
         } catch (error: CancellationException) {
             throw error
-        } catch (error: Exception) {
-            metadataError = error
+        } catch (_: Exception) {
             null
         }
         return try {
@@ -314,9 +392,8 @@ object LiveLyricsNotification {
                 album = song.album,
                 localizedAliases = listOfNotNull(localizedMetadata)
             )
-            if (qqLyrics == null && metadataError != null) throw metadataError
             if (qqLyrics != null) {
-                cache.put("qq", song.id, qqLyrics)
+                cache.put("qq", cacheKeyId, qqLyrics)
                 qqLyrics
             } else {
                 appleLyrics
@@ -324,27 +401,7 @@ object LiveLyricsNotification {
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            metadataError?.takeIf { it !== error }?.let(error::addSuppressed)
-            if (appleLyrics != null) {
-                Log.w(TAG, "QQ 歌词不可用，使用 Apple Music 歌词：${error.message}")
-                appleLyrics
-            } else {
-                throw error
-            }
-        }
-    }
-
-    private fun requestPromotion(builder: Notification.Builder) {
-        try {
-            builder.javaClass
-                .getMethod("setRequestPromotedOngoing", Boolean::class.javaPrimitiveType)
-                .invoke(builder, true)
-        } catch (_: NoSuchMethodException) {
-            Log.w(TAG, "This Android 16 build does not expose setRequestPromotedOngoing")
-        } catch (error: InvocationTargetException) {
-            Log.e(TAG, "Could not request Live Update promotion", error.cause ?: error)
-        } catch (error: IllegalAccessException) {
-            Log.e(TAG, "Could not request Live Update promotion", error)
+            appleLyrics ?: throw error
         }
     }
 }

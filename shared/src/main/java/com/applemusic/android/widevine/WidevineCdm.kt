@@ -6,6 +6,9 @@ import com.applemusic.android.util.Logx
 import com.applemusic.android.util.PbReader
 import com.applemusic.android.util.PbWriter
 
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * 一条内容密钥。
  */
@@ -52,28 +55,29 @@ class WidevineCdm(private val device: WvdDevice) {
     /** 测试辅助：从 challenge 字节里取回该次会话的上下文。 */
     internal fun sessionOf(challenge: ByteArray): Session? = companionSession(challenge)
 
-    private val pending = HashMap<String, Ctx>()
+    private val pending = ConcurrentHashMap<String, Ctx>()
 
-    private var sessionCounter = 0
+    private val sessionCounter = AtomicLong(0L)
 
     /** 最近一次 challenge 的调试信息。 */
+    @Volatile
     var lastDebug = ""
 
     companion object {
         private const val TAG = "WidevineCdm"
+        private const val MAX_PENDING_SESSIONS = 64
 
-        /** requestId(hex) → 上下文；`parseLicense` 靠它取回派生密钥所需的上下文。 */
-        private val pendingSessions = HashMap<String, Session>()
+        /** requestId(hex) → 上下文（并发安全）；`parseLicense` 靠它取回派生密钥所需的上下文。 */
+        private val pendingSessions = ConcurrentHashMap<String, Session>()
 
-        internal fun companionSession(challenge: ByteArray): Session? {
-            var msg = ByteArray(0)
-            try {
+        private fun extractRequestIdHex(challenge: ByteArray): String? {
+            return try {
+                var msg = ByteArray(0)
                 val r = PbReader(challenge)
                 while (!r.eof()) {
                     val f = r.next() ?: break
                     if (f.field == 2) msg = f.bytes
                 }
-                // LicenseRequest.content_id(2) → widevine_pssh_data(1) → request_id(3)
                 var contentId = ByteArray(0)
                 val lr = PbReader(msg)
                 while (!lr.eof()) {
@@ -92,11 +96,15 @@ class WidevineCdm(private val device: WvdDevice) {
                     val f = pr.next() ?: break
                     if (f.field == 3) requestId = f.bytes
                 }
-                if (requestId.isEmpty()) return null
-                return pendingSessions[ByteOps.toHex(requestId)]
+                if (requestId.isEmpty()) null else ByteOps.toHex(requestId)
             } catch (_: Throwable) {
-                return null
+                null
             }
+        }
+
+        internal fun companionSession(challenge: ByteArray): Session? {
+            val key = extractRequestIdHex(challenge) ?: return null
+            return pendingSessions[key]
         }
 
         private fun encContext(msg: ByteArray): ByteArray =
@@ -133,8 +141,7 @@ class WidevineCdm(private val device: WvdDevice) {
         val rnd = ByteArray(4)
         java.security.SecureRandom().nextBytes(rnd)
         System.arraycopy(rnd, 0, ridRaw, 0, 4)
-        sessionCounter++
-        var num = sessionCounter.toLong()
+        var num = sessionCounter.incrementAndGet()
         for (bi in 0 until 8) {
             ridRaw[8 + bi] = (num % 256).toByte()
             num /= 256
@@ -175,14 +182,28 @@ class WidevineCdm(private val device: WvdDevice) {
             .bytes(3, signature)
             .toByteArray()
 
-        pending[ByteOps.toHex(ctx.requestId)] = ctx
-        pendingSessions[ByteOps.toHex(ctx.requestId)] = Session(
+        if (pending.size > MAX_PENDING_SESSIONS) {
+            pending.clear()
+        }
+        if (pendingSessions.size > MAX_PENDING_SESSIONS) {
+            pendingSessions.clear()
+        }
+        val hexKey = ByteOps.toHex(ctx.requestId)
+        pending[hexKey] = ctx
+        pendingSessions[hexKey] = Session(
             ctx.requestId, ctx.encContext, ctx.macContext, ctx.requestBody
         )
         lastDebug = "rsaBits=${device.rsaBits} requestIdLen=${ctx.requestId.size} reqLen=${request.size} " +
                 "sigLen=${signature.size} challengeLen=${signed.size}"
         Logx.i(TAG, "challenge: $lastDebug")
         return signed
+    }
+
+    /** 释放未完成/已失败的 challenge 上下文，防止内存泄漏。 */
+    fun discardChallenge(challenge: ByteArray) {
+        val hexKey = extractRequestIdHex(challenge) ?: return
+        pending.remove(hexKey)
+        pendingSessions.remove(hexKey)
     }
 
     /**
@@ -226,8 +247,9 @@ class WidevineCdm(private val device: WvdDevice) {
         }
 
         val ctxKey = ByteOps.toHex(requestId)
-        val ctx = pending[ctxKey]
+        val ctx = pending.remove(ctxKey)
             ?: throw IllegalStateException("找不到该 license 对应的 challenge 上下文（requestId=${ctxKey.take(16)}…）")
+        pendingSessions.remove(ctxKey)
 
         // ---- 解密 session_key，派生密钥 ----
         val sessionKeyPlain = Crypto.rsaOaepSha1Decrypt(priKey, sessionKey)
@@ -259,8 +281,6 @@ class WidevineCdm(private val device: WvdDevice) {
             result.add(ck)
         }
 
-        pending.remove(ctxKey)
-        pendingSessions.remove(ctxKey)
         return result
     }
 

@@ -49,25 +49,28 @@ class ShelfItem(
 ) {
     val isAlbum get() = type.contains("album", ignoreCase = true)
     val isPlaylist get() = type.contains("playlist", ignoreCase = true)
-    val isLibraryPlaylist get() = type.contains("library", ignoreCase = true) &&
-        isPlaylist
-    val isStation get() = type == "stations"
-    val isArtist get() = type == "artists"
+    val isLibraryPlaylist get() = type.contains("library", ignoreCase = true) && isPlaylist
+    val isLibraryAlbum get() = type.contains("library", ignoreCase = true) && isAlbum
+    val isStation get() = type.equals("stations", ignoreCase = true)
+    val isArtist get() = type.equals("artists", ignoreCase = true)
     val isSong get() =
-        type.contains("song", ignoreCase = true) ||
-            songLike ||
-            catalogId.isNotBlank() ||
-            id.startsWith("i.")
+        !isAlbum && !isPlaylist && !isStation && !isArtist && (
+            type.contains("song", ignoreCase = true) ||
+                songLike ||
+                catalogId.isNotBlank() ||
+                id.startsWith("i.")
+            )
     val isLibrarySong get() =
-        type.contains("library", ignoreCase = true) || id.startsWith("i.")
+        isSong && (type.contains("library", ignoreCase = true) || id.startsWith("i."))
 
     /** 卡片右下角的小标签。 */
     val badge: String
-        get() = when (type) {
-            "albums" -> "专辑"
-            "playlists", "library-playlists" -> "歌单"
-            "stations" -> "电台"
-            else -> if (isSong) "歌曲" else ""
+        get() = when {
+            isAlbum -> "专辑"
+            isPlaylist -> "歌单"
+            isStation -> "电台"
+            isSong -> "歌曲"
+            else -> ""
         }
 
 }

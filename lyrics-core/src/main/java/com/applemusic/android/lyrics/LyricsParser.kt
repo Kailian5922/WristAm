@@ -1,6 +1,12 @@
 package com.applemusic.android.lyrics
 
 import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
+import java.io.StringReader
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToLong
 
 /** 一个字/词的时间轴片段，以及它在整行文本里的字符区间（用于逐字染色）。 */
 class LyricWord(
@@ -21,20 +27,18 @@ class LyricLine(
     val translation: String? = null,
     /** Apple TTML 行标识，可用于关联独立返回的译文。 */
     val key: String? = null,
-    internal val isTranslationParagraph: Boolean = false
+    internal val isTranslationParagraph: Boolean = false,
+    internal val agentId: String? = null
 ) {
     val isBlank: Boolean get() = text.isBlank()
     val hasWordTiming: Boolean get() = words.isNotEmpty()
 
     /**
      * [ms] 时刻这行已经「唱到」第几个字符 —— 逐字染色就靠它。
-     *
-     * 正在唱的那个字按时间比例推进，所以进度是连续增长而不是一格一格跳。
      */
     fun sungChars(ms: Long): Int {
         if (text.isEmpty()) return 0
         if (words.isEmpty()) {
-            // 没有逐字信息：整行按行级时间轴处理（过半即视为已唱完）
             return when {
                 ms >= endMs -> text.length
                 ms <= startMs -> 0
@@ -44,13 +48,13 @@ class LyricLine(
         var n = 0
         for (w in words) {
             if (ms >= w.endMs) {
-                n = w.charEnd
+                n = maxOf(n, w.charEnd)
             } else if (ms >= w.startMs) {
                 val span = (w.endMs - w.startMs).coerceAtLeast(1L)
                 val frac = ((ms - w.startMs).toDouble() / span).coerceIn(0.0, 1.0)
-                val wordChars = w.charEnd - w.charStart
+                val wordChars = (w.charEnd - w.charStart).coerceAtLeast(0)
                 val charsIntoWord = ((wordChars * frac).toInt() + 1).coerceAtMost(wordChars)
-                n = w.charStart + charsIntoWord
+                n = maxOf(n, w.charStart + charsIntoWord)
                 break
             } else {
                 break
@@ -75,7 +79,7 @@ class Lyrics(
         var hi = lines.size - 1
         var best = -1
         while (lo <= hi) {
-            val mid = (lo + hi) / 2
+            val mid = (lo + hi) ushr 1
             if (lines[mid].startMs <= ms) {
                 best = mid
                 lo = mid + 1
@@ -86,7 +90,7 @@ class Lyrics(
         return best
     }
 
-    /** 有逐字时间轴的行数 / 总行数。 */
+    /** 有逐字时间轴的行数。 */
     fun wordTimedLines(): Int = lines.count { it.hasWordTiming }
 
     /** 逐字片段总数。 */
@@ -94,94 +98,59 @@ class Lyrics(
 }
 
 /**
- * Apple Music 歌词解析（支持逐行与逐字时间轴）。
+ * Apple Music 歌词解析（支持 TTML 逐字/逐行时间轴与标准 LRC）。
  *
- * Apple 用 `l[lyrics]=ttml` 返回 **TTML**（W3C Timed Text）。当 `data[0].type` 是
- * `syllable-lyrics` 时，`<p>` 里面还会有**逐字/逐词的 `<span begin end>`**：
- * ```xml
- * <tt xmlns="http://www.w3.org/ns/ttml">
- *   <body><div>
- *     <p begin="00:00:12.345" end="00:00:15.678" itunes:key="L1">
- *       <span begin="00:00:12.345" end="00:00:12.900">天</span>
- *       <span begin="00:00:12.900" end="00:00:13.400">若</span>
- *       <span begin="00:00:13.400" end="00:00:15.678">有情</span>
- *     </p>
- *     <p begin="00:00:15.678" end="00:00:18.000"/>          <!-- 间奏空行 -->
- *   </div></body>
- * </tt>
- * ```
- * 本项目**两级都用**：行级时间轴决定高亮哪一行，字级时间轴决定这一行染到第几个字
- * （卡拉 OK 效果）。若某行拿不到字级时间轴，就退回整行高亮，不会出错。
- *
- * 拿不到 TTML 时退回 `attributes.lyrics`，它通常是 LRC 风格：
- * ```
- * [00:12.34] Line one
- * [00:15.67] Line two
- * ```
- * 若连时间戳都没有，就当作纯文本（[Lyrics.synced] = false）。
+ * 使用 Android 原生 [XmlPullParser] 解析 TTML，正确处理：
+ * - 任意深度的嵌套 `<span>`（`ttm:role="x-bg"`、`x-translation`、`x-roman`）；
+ * - 所有 TTML 时间格式（`HH:MM:SS.mmm`、`MM:SS.mmm`、`s`/`ms`/`m`/`h`/`f`/`t`、`dur`）；
+ * - 按语言优先级选择 `<translation xml:lang="...">` 译文块；
+ * - 完整规范 LRC 解析（`[offset:]`、元数据过滤、多时间戳行展开、按时排序、双语合并）。
  */
 object LyricsParser {
 
-    /**
-     * 一个正则同时吃下两种 `<p>`：
-     *   - `<p ...>文本</p>` —— 普通歌词行
-     *   - `<p .../>`        —— Apple 用它表示间奏空行，**可以和普通行混排**
-     * 早期版本只在「一个普通 `<p>` 都没匹配到」时才去看自闭合形式，
-     * 于是混排时整段间奏会被漏掉（歌词时间轴就错位了）。
-     */
-    private val P_RE = Regex(
-        "<p\\b([^>]*?)(?:/>|>(.*?)</p>)",
-        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    private val WHITESPACE_RE = Regex("\\s+")
+    private val XML_ENTITY_RE = Regex("&(#x[0-9A-Fa-f]+|#\\d+|[a-zA-Z]+);")
+    private val LRC_TAG_RE = Regex("^\\[([a-zA-Z]+):([^\\]]*)]$")
+    private val LRC_TIME_PREFIX_RE = Regex("^\\[(?:(\\d+):)?(\\d{1,3}):(\\d{1,2})(?:[.:](\\d+))?]")
+    private val OFFSET_TIME_RE = Regex("^([+-]?\\d+(?:\\.\\d+)?)(ms|s|m|h|f|t)$", RegexOption.IGNORE_CASE)
+
+    private val LRC_METADATA_TAGS = setOf(
+        "ti", "ar", "al", "au", "by", "re", "ve", "length",
+        "offset", "id", "hash", "sign", "qq", "total", "language", "lr"
     )
-    private val SPAN_RE = Regex(
-        "<span\\b([^>]*?)>(.*?)</span>",
-        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+
+    private data class SpanFrame(
+        val isTranslation: Boolean,
+        val isRoman: Boolean,
+        val isBg: Boolean,
+        val timed: Boolean,
+        val startMs: Long,
+        val endMs: Long,
+        val textStartIndex: Int,
+        var hasTimedChild: Boolean = false
     )
-    private val BEGIN_RE = Regex("begin\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val END_RE = Regex("end\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val KEY_RE = Regex("(?:[\\w.-]+:)?key\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val AGENT_RE = Regex(
-        "<(?:[\\w.-]+:)?agent\\b([^>]*)/?>",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-    )
-    private val ID_RE = Regex("(?:xml:)?id\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val ROLE_RE = Regex("(?:[\\w.-]+:)?role\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val AGENT_REF_RE = Regex("(?:[\\w.-]+:)?agent\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val TRANSLATION_BLOCK_RE = Regex(
-        "<translation\\b([^>]*)>(.*?)</translation>",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-    )
-    private val TEXT_FOR_RE = Regex(
-        "<text\\b([^>]*)>(.*?)</text>",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-    )
-    private val FOR_RE = Regex("(?:[\\w.-]+:)?for\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val TYPE_RE = Regex("(?:[\\w.-]+:)?type\\s*=\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-    private val TAG_RE = Regex("<[^>]*>")
-    private val BR_RE = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
-    private val LRC_RE = Regex("^\\[(\\d+):(\\d+(?:\\.\\d+)?)]\\s*(.*)$")
 
     /** 从歌词接口的原始 JSON 里解析。解析不出返回 null。 */
-    fun parse(json: String): Lyrics? {
+    fun parse(json: String, preferredLocale: String = Locale.getDefault().toLanguageTag()): Lyrics? {
         val ttml: String
         val plain: String
         val kind: String
         try {
             val data = JSONObject(json).optJSONArray("data")
             if (data == null || data.length() == 0) return null
-            val first = data.getJSONObject(0)
+            val first = data.optJSONObject(0) ?: return null
             kind = first.optString("type", "")
             val attrs = first.optJSONObject("attributes") ?: return null
             ttml = attrs.optString("ttmlLocalizations")
                 .takeIf { it.isNotBlank() }
                 ?: attrs.optString("ttml", "")
             plain = attrs.optString("lyrics", "")
-        } catch (e: Throwable) {
+        } catch (_: Throwable) {
             return null
         }
 
         if (ttml.isNotEmpty()) {
-            parseTtml(ttml, kind)?.let { if (it.lines.isNotEmpty()) return it }
+            parseTtml(ttml, kind, preferredLocale)?.let { if (it.lines.isNotEmpty()) return it }
         }
         if (plain.isNotEmpty()) {
             return parsePlain(plain, kind)
@@ -189,52 +158,275 @@ object LyricsParser {
         return null
     }
 
-    /** 解析 TTML。 */
-    fun parseTtml(ttml: String, kind: String = ""): Lyrics? {
-        val paragraphs = ArrayList<LyricLine>(64)
-        val metadataTranslations = parseMetadataTranslations(ttml)
-        val translationAgents = AGENT_RE.findAll(ttml).mapNotNull { match ->
-            val attrs = match.groupValues[1]
-            val id = ID_RE.find(attrs)?.groupValues?.get(1) ?: return@mapNotNull null
-            val role = ROLE_RE.find(attrs)?.groupValues?.get(1).orEmpty()
-            if (role.contains("translation", ignoreCase = true)) id else null
-        }.toSet()
+    /** 使用 XmlPullParser 解析 TTML（正确支持嵌套 span、dur、时间单位与语言匹配）。 */
+    fun parseTtml(
+        ttml: String,
+        kind: String = "",
+        preferredLocale: String = Locale.getDefault().toLanguageTag()
+    ): Lyrics? {
+        if (ttml.isBlank()) return null
 
-        for (m in P_RE.findAll(ttml)) {
-            val attrs = m.groupValues[1]
-            // 自闭合形式没有 group[2]（返回空串）
-            val body = m.groupValues.getOrNull(2) ?: ""
-            val begin = BEGIN_RE.find(attrs)?.groupValues?.get(1)?.let { parseTime(it) } ?: continue
-            if (begin < 0) continue
-            val end = END_RE.find(attrs)?.groupValues?.get(1)?.let { parseTime(it) } ?: begin
-            val inlineTranslations = SPAN_RE.findAll(body)
-                .filter { it.groupValues[1].contains("x-translation", ignoreCase = true) }
-                .map { cleanText(it.groupValues[2]) }
-                .filter { it.isNotBlank() }
-                .toList()
-            val originalBody = SPAN_RE.replace(body) { match ->
-                if (match.groupValues[1].contains("x-translation", ignoreCase = true)) {
-                    ""
-                } else {
-                    match.value
+        val paragraphs = ArrayList<LyricLine>(64)
+        val translationAgents = HashSet<String>()
+        val metadataTranslations = LinkedHashMap<String, String>()
+        val metadataTranslationScores = HashMap<String, Int>()
+
+        var tickRate = 1000.0
+        var frameRate = 30.0
+
+        try {
+            val factory = XmlPullParserFactory.newInstance()
+            factory.isNamespaceAware = false
+            val parser = factory.newPullParser()
+            parser.setInput(StringReader(ttml))
+
+            var inTranslationBlock = false
+            var currentTranslationScore = 0
+            var currentTextForKey: String? = null
+            val currentMetadataText = StringBuilder()
+
+            var inParagraph = false
+            var pBeginMs = -1L
+            var pEndMs = -1L
+            var pKey: String? = null
+            var pAgent: String? = null
+            var pIsTranslation = false
+
+            val mainText = StringBuilder()
+            val mainWords = ArrayList<LyricWord>()
+            val bgText = StringBuilder()
+            val bgWords = ArrayList<LyricWord>()
+            val inlineTransText = StringBuilder()
+            val spanStack = ArrayList<SpanFrame>()
+
+            var eventType = parser.eventType
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                when (eventType) {
+                    XmlPullParser.START_TAG -> {
+                        val tag = localName(parser.name)
+                        when (tag) {
+                            "tt" -> {
+                                attrValue(parser, "tickrate")?.toDoubleOrNull()
+                                    ?.takeIf { it > 0.0 }?.let { tickRate = it }
+                                attrValue(parser, "framerate")?.toDoubleOrNull()
+                                    ?.takeIf { it > 0.0 }?.let { frameRate = it }
+                            }
+
+                            "agent" -> {
+                                val id = attrValue(parser, "id")
+                                val role = attrValue(parser, "role").orEmpty()
+                                if (!id.isNullOrBlank() && role.contains("translation", ignoreCase = true)) {
+                                    translationAgents.add(id)
+                                }
+                            }
+
+                            "translation" -> {
+                                val type = attrValue(parser, "type")
+                                if (type == null || type.equals("subtitle", ignoreCase = true)) {
+                                    inTranslationBlock = true
+                                    val lang = attrValue(parser, "lang").orEmpty()
+                                    currentTranslationScore = scoreLocaleMatch(lang, preferredLocale)
+                                }
+                            }
+
+                            "text" -> {
+                                if (inTranslationBlock) {
+                                    currentTextForKey = attrValue(parser, "for")
+                                    currentMetadataText.setLength(0)
+                                }
+                            }
+
+                            "p" -> {
+                                val beginRaw = attrValue(parser, "begin")
+                                val beginMs = beginRaw?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                if (beginMs >= 0L) {
+                                    val endRaw = attrValue(parser, "end")
+                                    val durRaw = attrValue(parser, "dur")
+                                    val parsedEnd = endRaw?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                    val parsedDur = durRaw?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                    val endMs = when {
+                                        parsedEnd > beginMs -> parsedEnd
+                                        parsedDur > 0L -> beginMs + parsedDur
+                                        else -> beginMs
+                                    }
+                                    inParagraph = true
+                                    pBeginMs = beginMs
+                                    pEndMs = endMs
+                                    pKey = attrValue(parser, "key")
+                                    pAgent = attrValue(parser, "agent")
+                                    val pRole = attrValue(parser, "role").orEmpty()
+                                    pIsTranslation = pRole.contains("x-translation", ignoreCase = true) ||
+                                        (pAgent != null && pAgent in translationAgents)
+                                    mainText.setLength(0)
+                                    mainWords.clear()
+                                    bgText.setLength(0)
+                                    bgWords.clear()
+                                    inlineTransText.setLength(0)
+                                    spanStack.clear()
+                                }
+                            }
+
+                            "span" -> {
+                                if (inParagraph) {
+                                    val role = attrValue(parser, "role").orEmpty()
+                                    val parent = spanStack.lastOrNull()
+                                    val isTrans = (parent?.isTranslation == true) ||
+                                        role.contains("x-translation", ignoreCase = true)
+                                    val isRoman = (parent?.isRoman == true) ||
+                                        role.contains("x-roman", ignoreCase = true) ||
+                                        role.contains("translit", ignoreCase = true)
+                                    val isBg = (parent?.isBg == true) ||
+                                        role.contains("x-bg", ignoreCase = true)
+
+                                    val sBegin = attrValue(parser, "begin")
+                                        ?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                    val sEndRaw = attrValue(parser, "end")
+                                        ?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                    val sDurRaw = attrValue(parser, "dur")
+                                        ?.let { parseTime(it, tickRate, frameRate) } ?: -1L
+                                    val timed = sBegin >= 0L && !isTrans && !isRoman
+                                    val sEnd = when {
+                                        !timed -> sBegin
+                                        sEndRaw > sBegin -> sEndRaw
+                                        sDurRaw > 0L -> sBegin + sDurRaw
+                                        else -> sBegin
+                                    }
+                                    if (timed) {
+                                        parent?.hasTimedChild = true
+                                    }
+                                    val targetBuilder = if (isBg) bgText else mainText
+                                    spanStack.add(
+                                        SpanFrame(
+                                            isTranslation = isTrans,
+                                            isRoman = isRoman,
+                                            isBg = isBg,
+                                            timed = timed,
+                                            startMs = sBegin,
+                                            endMs = sEnd,
+                                            textStartIndex = targetBuilder.length
+                                        )
+                                    )
+                                }
+                            }
+
+                            "br" -> {
+                                if (inParagraph) {
+                                    val frame = spanStack.lastOrNull()
+                                    when {
+                                        frame?.isTranslation == true -> appendNormalizedSpace(inlineTransText)
+                                        frame?.isRoman == true -> Unit
+                                        frame?.isBg == true -> appendNormalizedSpace(bgText)
+                                        else -> appendNormalizedSpace(mainText)
+                                    }
+                                } else if (inTranslationBlock && currentTextForKey != null) {
+                                    appendNormalizedSpace(currentMetadataText)
+                                }
+                            }
+                        }
+                    }
+
+                    XmlPullParser.TEXT -> {
+                        val raw = parser.text.orEmpty()
+                        if (raw.isNotEmpty()) {
+                            if (inParagraph) {
+                                val frame = spanStack.lastOrNull()
+                                when {
+                                    frame?.isTranslation == true -> appendNormalizedText(inlineTransText, raw)
+                                    frame?.isRoman == true -> Unit
+                                    frame?.isBg == true -> appendNormalizedText(bgText, raw)
+                                    else -> appendNormalizedText(mainText, raw)
+                                }
+                            } else if (inTranslationBlock && currentTextForKey != null) {
+                                appendNormalizedText(currentMetadataText, raw)
+                            }
+                        }
+                    }
+
+                    XmlPullParser.END_TAG -> {
+                        val tag = localName(parser.name)
+                        when (tag) {
+                            "translation" -> {
+                                inTranslationBlock = false
+                                currentTranslationScore = 0
+                                currentTextForKey = null
+                            }
+
+                            "text" -> {
+                                val key = currentTextForKey
+                                if (inTranslationBlock && !key.isNullOrBlank()) {
+                                    val value = currentMetadataText.toString().trim()
+                                    val prevScore = metadataTranslationScores[key] ?: -1
+                                    if (value.isNotBlank() && currentTranslationScore >= prevScore) {
+                                        metadataTranslations[key] = value
+                                        metadataTranslationScores[key] = currentTranslationScore
+                                    }
+                                }
+                                currentTextForKey = null
+                                currentMetadataText.setLength(0)
+                            }
+
+                            "span" -> {
+                                if (inParagraph && spanStack.isNotEmpty()) {
+                                    val frame = spanStack.removeAt(spanStack.lastIndex)
+                                    if (frame.timed && !frame.hasTimedChild) {
+                                        val builder = if (frame.isBg) bgText else mainText
+                                        val wordsList = if (frame.isBg) bgWords else mainWords
+                                        var startIdx = frame.textStartIndex
+                                        var endIdx = builder.length
+                                        while (startIdx < endIdx && builder[startIdx].isWhitespace()) startIdx++
+                                        while (endIdx > startIdx && builder[endIdx - 1].isWhitespace()) endIdx--
+                                        if (endIdx > startIdx) {
+                                            wordsList.add(
+                                                LyricWord(
+                                                    startMs = frame.startMs,
+                                                    endMs = maxOf(frame.endMs, frame.startMs),
+                                                    charStart = startIdx,
+                                                    charEnd = endIdx
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            "p" -> {
+                                if (inParagraph) {
+                                    val useBgFallback = mainText.toString().isBlank() && bgText.toString().isNotBlank()
+                                    val rawText = (if (useBgFallback) bgText else mainText).toString()
+                                    val trimmedText = rawText.trim()
+                                    val leadingTrim = rawText.indexOfFirst { !it.isWhitespace() }.coerceAtLeast(0)
+                                    val rawWords = if (useBgFallback) bgWords else mainWords
+                                    val normalizedWords = normalizeWords(rawWords, leadingTrim, trimmedText.length)
+                                    val inlineTrans = inlineTransText.toString().trim().ifBlank { null }
+
+                                    paragraphs.add(
+                                        LyricLine(
+                                            startMs = pBeginMs,
+                                            endMs = pEndMs,
+                                            text = trimmedText,
+                                            words = normalizedWords,
+                                            translation = inlineTrans,
+                                            key = pKey,
+                                            isTranslationParagraph = pIsTranslation,
+                                            agentId = pAgent
+                                        )
+                                    )
+                                    inParagraph = false
+                                    spanStack.clear()
+                                }
+                            }
+                        }
+                    }
                 }
+                eventType = parser.next()
             }
-            val text = cleanText(originalBody)
-            val words = parseWords(originalBody, text)
-            paragraphs.add(
-                LyricLine(
-                    begin,
-                    if (end > begin) end else begin,
-                    text,
-                    words,
-                    translation = inlineTranslations.joinToString("\n").ifBlank { null },
-                    key = KEY_RE.find(attrs)?.groupValues?.get(1),
-                    isTranslationParagraph = attrs.contains("x-translation", ignoreCase = true) ||
-                        AGENT_REF_RE.find(attrs)?.groupValues?.get(1) in translationAgents
-                )
-            )
+        } catch (_: Throwable) {
+            if (paragraphs.isEmpty()) return null
         }
 
+        if (paragraphs.isEmpty()) return null
+
+        // 推断未显式标记 x-translation 的译文段落（仅在同 key 或非不同人声 agent 的双行间推断）
         val inferredTranslationIndices = HashSet<Int>()
         val unmarked = paragraphs.withIndex().filterNot { it.value.isTranslationParagraph }
         val groups = unmarked.groupBy { indexed ->
@@ -242,261 +434,438 @@ object LyricsParser {
         }
         for (group in groups.values) {
             if (group.size < 2) continue
-            val primaryIndex = group.firstOrNull { it.value.hasWordTiming }?.index
-                ?: group.first().index
+            val distinctAgents = group.mapNotNull { it.value.agentId?.takeIf(String::isNotBlank) }.toSet()
+            // 同时间段不同人声代理（如 v1/v2 合唱）不应误判为译文并删除
+            val sameKeyGroup = group.first().value.key != null
+            if (!sameKeyGroup && distinctAgents.size >= 2) continue
+            val hasWordTimedAndPlainMix = group.any { it.value.hasWordTiming } && group.any { !it.value.hasWordTiming }
+            if (!sameKeyGroup && !hasWordTimedAndPlainMix) continue
+
+            val primaryIndex = group.firstOrNull { it.value.hasWordTiming }?.index ?: group.first().index
             group.filter { it.index != primaryIndex }.forEach {
                 inferredTranslationIndices.add(it.index)
             }
         }
+
         val translationIndices = paragraphs.indices.filter {
             paragraphs[it].isTranslationParagraph || it in inferredTranslationIndices
         }.toSet()
         val original = paragraphs.filterIndexed { index, _ -> index !in translationIndices }
         if (original.isEmpty()) return null
-        val translationsByKey = paragraphs
-            .filterIndexed { index, _ -> index in translationIndices }
-            .filter { !it.key.isNullOrBlank() }
-            .associate { it.key!! to it.text }
-            .toMutableMap()
+
+        val translationsByKey = LinkedHashMap<String, String>()
+        paragraphs.filterIndexed { index, _ -> index in translationIndices }
+            .filter { !it.key.isNullOrBlank() && it.text.isNotBlank() }
+            .forEach { translationsByKey[it.key!!] = it.text }
         translationsByKey.putAll(metadataTranslations)
+
         val unmatchedTranslations = paragraphs.withIndex()
             .filter { it.index in translationIndices }
             .map { it.value }
             .filter { it.key.isNullOrBlank() && it.text.isNotBlank() }
             .toMutableList()
-        val out = original.map { line ->
-            val translatedText = line.key?.let(translationsByKey::get)
-                ?.takeIf { it != line.text }
-                ?: unmatchedTranslations.firstOrNull { it.startMs == line.startMs }?.text
-            if (translatedText == null) {
+
+        val merged = original.map { line ->
+            val existingInline = line.translation?.takeIf { it.isNotBlank() && it != line.text }
+            val resolvedTranslation = existingInline
+                ?: line.key?.let(translationsByKey::get)?.takeIf { it != line.text }
+                ?: run {
+                    val idx = unmatchedTranslations.indexOfFirst {
+                        it.startMs == line.startMs && it.text != line.text
+                    }
+                    if (idx >= 0) unmatchedTranslations.removeAt(idx).text else null
+                }
+            if (resolvedTranslation == line.translation) {
                 line
             } else {
-                unmatchedTranslations.removeAll {
-                    it.startMs == line.startMs && it.text == translatedText
-                }
                 LyricLine(
-                    line.startMs,
-                    line.endMs,
-                    line.text,
-                    line.words,
-                    translatedText,
-                    line.key
+                    startMs = line.startMs,
+                    endMs = line.endMs,
+                    text = line.text,
+                    words = line.words,
+                    translation = resolvedTranslation,
+                    key = line.key,
+                    agentId = line.agentId
                 )
             }
         }.sortedBy { it.startMs }
-        return Lyrics(out, true, kind)
+
+        // 补齐缺失的 endMs（例如自闭合间奏 <p begin="15.0"/> 或无 end 属性的行）
+        val finalized = backfillMissingEndMs(merged)
+        return Lyrics(finalized, true, kind)
     }
 
     /**
-     * Merge translation data from Apple's separate lyrics resource into the
-     * word-timed lyric resource. Apple may return translations only on /lyrics.
+     * 将 Apple 单独 `/lyrics` 接口返回的译文合并到逐字歌词资源中。
      */
-    fun mergeTranslations(original: Lyrics, translationJson: String): Lyrics {
+    fun mergeTranslations(
+        original: Lyrics,
+        translationJson: String,
+        preferredLocale: String = Locale.getDefault().toLanguageTag()
+    ): Lyrics {
         val attributes = try {
             JSONObject(translationJson).optJSONArray("data")
                 ?.optJSONObject(0)?.optJSONObject("attributes")
         } catch (_: Exception) {
             null
         } ?: return original
+
         val ttml = attributes.optString("ttmlLocalizations")
             .takeIf { it.isNotBlank() }
             ?: attributes.optString("ttml").takeIf { it.isNotBlank() }
-        val translationByKey = ttml?.let(::parseMetadataTranslations).orEmpty().toMutableMap()
-        val candidates = ttml
-            ?.let(::parseTtml)
-            ?.lines
-            ?.mapNotNull { line ->
-                line.translation?.takeIf { it.isNotBlank() }?.let { translation ->
-                    if (!line.key.isNullOrBlank()) translationByKey[line.key] = translation
-                    LyricLine(line.startMs, line.endMs, translation, key = line.key)
-                }
-            }
-            .orEmpty()
-        val plainCandidates = if (ttml == null) {
-            attributes.optString("lyrics")
-                .takeIf { it.isNotBlank() }
-                ?.let(::parsePlain)
-                ?.lines
-                ?.filter { it.text.isNotBlank() }
-                .orEmpty()
-        } else {
-            emptyList()
+            ?: return original
+
+        val parsed = parseTtml(ttml, preferredLocale = preferredLocale) ?: return original
+        val translationByKey = HashMap<String, String>()
+        val candidates = ArrayList<LyricLine>()
+        for (line in parsed.lines) {
+            val trans = line.translation?.takeIf { it.isNotBlank() } ?: continue
+            if (!line.key.isNullOrBlank()) translationByKey[line.key] = trans
+            candidates.add(LyricLine(line.startMs, line.endMs, trans, key = line.key))
         }
-        if (translationByKey.isEmpty() && candidates.isEmpty() && plainCandidates.isEmpty()) {
+        if (translationByKey.isEmpty() && candidates.isEmpty()) {
             return original
         }
 
+        val usedCandidates = BooleanArray(candidates.size)
         val merged = original.lines.map { line ->
             if (!line.translation.isNullOrBlank()) return@map line
-            val byKey = line.key?.let(translationByKey::get)
-            val candidate = if (byKey == null) {
-                (candidates + plainCandidates).firstOrNull { candidate ->
-                    candidate.text != line.text &&
-                        kotlin.math.abs(candidate.startMs - line.startMs) <= 1_500L
-                }?.text
-            } else {
-                byKey
+            val byKey = line.key?.let(translationByKey::get)?.takeIf { it != line.text }
+            val resolved = byKey ?: run {
+                var bestIdx = -1
+                var bestDiff = Long.MAX_VALUE
+                for (i in candidates.indices) {
+                    if (usedCandidates[i]) continue
+                    val cand = candidates[i]
+                    if (cand.text == line.text) continue
+                    val diff = abs(cand.startMs - line.startMs)
+                    if (diff <= 1_500L && diff < bestDiff) {
+                        bestDiff = diff
+                        bestIdx = i
+                    }
+                }
+                if (bestIdx >= 0) {
+                    usedCandidates[bestIdx] = true
+                    candidates[bestIdx].text
+                } else {
+                    null
+                }
             }
-            val translatedText = candidate?.takeIf { it != line.text } ?: return@map line
-            LyricLine(
-                line.startMs,
-                line.endMs,
-                line.text,
-                line.words,
-                translatedText,
-                line.key
-            )
+            if (resolved == null) {
+                line
+            } else {
+                LyricLine(
+                    startMs = line.startMs,
+                    endMs = line.endMs,
+                    text = line.text,
+                    words = line.words,
+                    translation = resolved,
+                    key = line.key,
+                    agentId = line.agentId
+                )
+            }
         }
         return Lyrics(merged, original.synced, original.kind)
     }
 
-    private fun parseMetadataTranslations(ttml: String): Map<String, String> {
-        val translations = LinkedHashMap<String, String>()
-        for (block in TRANSLATION_BLOCK_RE.findAll(ttml)) {
-            val type = TYPE_RE.find(block.groupValues[1])?.groupValues?.get(1)
-            if (!type.equals("subtitle", ignoreCase = true)) continue
-            for (text in TEXT_FOR_RE.findAll(block.groupValues[2])) {
-                val key = FOR_RE.find(text.groupValues[1])?.groupValues?.get(1)
-                    ?: continue
-                val value = cleanText(text.groupValues[2])
-                if (value.isNotBlank()) translations[key] = value
-            }
-        }
-        return translations
-    }
-
-    /**
-     * 把 `<p>` 里的 `<span begin end>` 转成字符区间。
-     *
-     * 做法：先把整行清洗成 [lineText]（这是真正显示出来的文本），再按顺序在
-     * [lineText] 里查找每个 span 的文本，记下字符区间。用「按顺序查找」而不是
-     * 自己拼接，是为了让 span 之间原有的空格/标点仍然算进正确的字符位置。
-     *
-     * 任何一个 span 找不到对应位置，就放弃这一行的字级时间轴（返回空），
-     * 该行退回整行高亮 —— 宁可不逐字，也不能染错位置。
-     */
-    private fun parseWords(body: String, lineText: String): List<LyricWord> {
-        if (lineText.isEmpty()) return emptyList()
-        val spans = SPAN_RE.findAll(body).toList()
-        if (spans.isEmpty()) return emptyList()
-
-        val out = ArrayList<LyricWord>(spans.size)
-        var cursor = 0
-        for (sp in spans) {
-            val attrs = sp.groupValues[1]
-            val inner = sp.groupValues[2]
-            val start = BEGIN_RE.find(attrs)?.groupValues?.get(1)?.let { parseTime(it) } ?: continue
-            if (start < 0) continue
-            val end = END_RE.find(attrs)?.groupValues?.get(1)?.let { parseTime(it) } ?: start
-            val wordText = cleanText(inner)
-            if (wordText.isEmpty()) continue
-
-            val at = lineText.indexOf(wordText, cursor)
-            if (at < 0) {
-                // 对不上就整行放弃字级时间轴
-                return emptyList()
-            }
-            out.add(
-                LyricWord(
-                    start,
-                    if (end > start) end else start,
-                    at,
-                    at + wordText.length
-                )
-            )
-            cursor = at + wordText.length
-        }
-        return out
-    }
-
-    /** 解析 `attributes.lyrics`：优先当 LRC，退化成纯文本。 */
+    /** 解析 `attributes.lyrics` 或标准 LRC；无任何时间戳时退化为纯文本。 */
     fun parsePlain(plain: String, kind: String = ""): Lyrics? {
-        val raw = plain.replace("\\n", "\n")
-        val lines = raw.split('\n')
-        val synced = ArrayList<LyricLine>(lines.size)
+        val raw = plain.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n").replace('\r', '\n')
+        val rawLines = raw.split('\n')
+
+        var offsetMs = 0L
         var anyTimestamp = false
-        for (ln in lines) {
+        val timedEntries = ArrayList<Pair<Long, String>>(rawLines.size)
+        val plainEntries = ArrayList<String>(rawLines.size)
+
+        for (ln in rawLines) {
             val t = ln.trim()
             if (t.isEmpty()) continue
-            val m = LRC_RE.find(t)
-            if (m != null) {
+
+            // 检查 LRC 元数据标签（如 [ti:...]、[offset:500]）
+            val metaMatch = LRC_TAG_RE.matchEntire(t)
+            if (metaMatch != null) {
+                val tagName = metaMatch.groupValues[1].lowercase(Locale.ROOT)
+                if (tagName == "offset") {
+                    offsetMs = metaMatch.groupValues[2].trim().toLongOrNull() ?: 0L
+                    continue
+                }
+                if (tagName in LRC_METADATA_TAGS) {
+                    continue
+                }
+            }
+
+            // 提取行首全部时间戳（支持多时间戳行如 [00:12.34][01:23.45]副歌）
+            var cursor = 0
+            val lineTimestamps = ArrayList<Long>(2)
+            while (cursor < t.length) {
+                val match = LRC_TIME_PREFIX_RE.find(t.substring(cursor)) ?: break
+                val hours = match.groupValues[1].toLongOrNull() ?: 0L
+                val minutes = match.groupValues[2].toLongOrNull() ?: 0L
+                val seconds = match.groupValues[3].toLongOrNull() ?: 0L
+                val fracRaw = match.groupValues[4]
+                val millis = parseFractionMillis(fracRaw)
+                val totalMs = hours * 3_600_000L + minutes * 60_000L + seconds * 1_000L + millis
+                lineTimestamps.add(totalMs)
+                cursor += match.value.length
+            }
+
+            if (lineTimestamps.isNotEmpty()) {
                 anyTimestamp = true
-                val min = m.groupValues[1].toLongOrNull() ?: 0L
-                val sec = m.groupValues[2].toDoubleOrNull() ?: 0.0
-                val ms = (min * 60_000L + (sec * 1000).toLong())
-                synced.add(LyricLine(ms, ms, m.groupValues[3].trim()))
+                val content = unescape(t.substring(cursor).trim())
+                for (ts in lineTimestamps) {
+                    timedEntries.add(ts to content)
+                }
             } else {
-                synced.add(LyricLine(-1L, -1L, t))
+                val cleaned = unescape(t)
+                if (cleaned.isNotEmpty()) {
+                    plainEntries.add(cleaned)
+                }
             }
         }
-        if (synced.isEmpty()) return null
+
         if (anyTimestamp) {
-            // 结束时间用下一行的开始补齐
-            val fixed = ArrayList<LyricLine>(synced.size)
-            for (i in synced.indices) {
-                val cur = synced[i]
-                val next = synced.getOrNull(i + 1)?.startMs ?: (cur.startMs + 5000)
-                fixed.add(
-                    LyricLine(
-                        cur.startMs,
-                        if (next > cur.startMs) next else cur.startMs + 5000,
-                        cur.text
-                    )
-                )
+            if (timedEntries.isEmpty()) return null
+            // 应用 [offset:]（正值表示歌词提前）并稳定排序
+            val adjusted = timedEntries
+                .map { (ts, text) -> (ts - offsetMs).coerceAtLeast(0L) to text }
+                .sortedBy { it.first }
+
+            // 合并同一时间戳的相邻双语行（仅合并非空且文本不同的连续双行）
+            val mergedLines = ArrayList<LyricLine>(adjusted.size)
+            var i = 0
+            while (i < adjusted.size) {
+                val (startMs, text) = adjusted[i]
+                var translation: String? = null
+                if (i + 1 < adjusted.size &&
+                    adjusted[i + 1].first == startMs &&
+                    text.isNotBlank() &&
+                    adjusted[i + 1].second.isNotBlank() &&
+                    adjusted[i + 1].second != text
+                ) {
+                    // 仅当同一时间戳恰好两行时视作原词+译文
+                    val hasThirdSameTs = i + 2 < adjusted.size && adjusted[i + 2].first == startMs
+                    if (!hasThirdSameTs) {
+                        translation = adjusted[i + 1].second
+                        i++
+                    }
+                }
+                mergedLines.add(LyricLine(startMs, startMs, text, translation = translation))
+                i++
             }
+
+            val fixed = backfillMissingEndMs(mergedLines)
             return Lyrics(fixed, true, kind)
         }
-        // 完全没有时间戳：整段纯文本
-        return Lyrics(synced.map { LyricLine(-1L, -1L, it.text) }, false, kind)
+
+        if (plainEntries.isEmpty()) return null
+        return Lyrics(plainEntries.map { LyricLine(-1L, -1L, it) }, false, kind)
     }
 
     /**
-     * 解析 TTML 的时间：支持 `HH:MM:SS.mmm`、`MM:SS.mmm`、`SS.mmm`、纯秒数。
-     * 解析不出返回 -1。
+     * 解析 TTML 时间：
+     * - 纯数字秒数：`12.345`
+     * - 带单位偏移：`12.345s`、`500ms`、`1.5m`、`0.5h`、`30f`、`1000t`
+     * - 时钟格式：`HH:MM:SS.mmm`、`MM:SS.mmm`、`HH:MM:SS:FF`
+     * 解析失败返回 -1。
      */
-    fun parseTime(s: String): Long {
+    fun parseTime(s: String, tickRate: Double = 1000.0, frameRate: Double = 30.0): Long {
         val t = s.trim()
         if (t.isEmpty()) return -1L
-        // 纯数字 = 秒（可带小数）
-        t.toDoubleOrNull()?.let { return (it * 1000).toLong() }
+
+        // 带单位偏移时间
+        val offsetMatch = OFFSET_TIME_RE.matchEntire(t)
+        if (offsetMatch != null) {
+            val value = offsetMatch.groupValues[1].toDoubleOrNull() ?: return -1L
+            if (value < 0.0) return -1L
+            val unit = offsetMatch.groupValues[2].lowercase(Locale.ROOT)
+            val ms = when (unit) {
+                "ms" -> value
+                "s" -> value * 1000.0
+                "m" -> value * 60_000.0
+                "h" -> value * 3_600_000.0
+                "f" -> value * (1000.0 / frameRate.coerceAtLeast(1.0))
+                "t" -> value * (1000.0 / tickRate.coerceAtLeast(1.0))
+                else -> return -1L
+            }
+            return ms.roundToLong()
+        }
+
+        // 纯数字（秒）
+        t.toDoubleOrNull()?.let { sec ->
+            return if (sec >= 0.0) (sec * 1000.0).roundToLong() else -1L
+        }
+
+        // 时钟格式
         val parts = t.split(':')
+        if (parts.size == 4) {
+            // HH:MM:SS:FF
+            val h = parts[0].toLongOrNull() ?: return -1L
+            val m = parts[1].toLongOrNull() ?: return -1L
+            val sec = parts[2].toDoubleOrNull() ?: return -1L
+            val frames = parts[3].toDoubleOrNull() ?: return -1L
+            if (h < 0 || m < 0 || sec < 0.0 || frames < 0.0) return -1L
+            val totalMs = ((h * 3600L + m * 60L) * 1000.0) + sec * 1000.0 +
+                frames * (1000.0 / frameRate.coerceAtLeast(1.0))
+            return totalMs.roundToLong()
+        }
         if (parts.isEmpty() || parts.size > 3) return -1L
-        var total = 0.0
+
+        var totalSec = 0.0
         for (p in parts) {
             val v = p.toDoubleOrNull() ?: return -1L
-            total = total * 60.0 + v
+            if (v < 0.0) return -1L
+            totalSec = totalSec * 60.0 + v
         }
-        return (total * 1000).toLong()
+        return (totalSec * 1000.0).roundToLong()
     }
 
-    /** 去掉标签、还原实体、压掉多余空白。 */
-    private fun cleanText(html: String): String {
-        var s = BR_RE.replace(html, " ")
-        s = TAG_RE.replace(s, "")
-        s = unescape(s)
-        return s.replace(Regex("\\s+"), " ").trim()
-    }
-
+    /** 单遍还原 XML/HTML 字符实体（杜绝 `&amp;#39;` 双重反转义与非法代理码点）。 */
     fun unescape(s: String): String {
         if (!s.contains('&')) return s
-        var out = s
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-        // 数字实体 &#123; / &#x1F600;
-        out = Regex("&#(x?[0-9A-Fa-f]+);").replace(out) { m ->
-            val body = m.groupValues[1]
-            val code = try {
-                if (body.startsWith("x") || body.startsWith("X")) body.substring(1).toInt(16)
-                else body.toInt()
-            } catch (_: Throwable) {
-                return@replace m.value
+        return XML_ENTITY_RE.replace(s) { m ->
+            val token = m.groupValues[1]
+            when {
+                token.startsWith("#x", ignoreCase = true) -> {
+                    decodeCodePoint(token.substring(2).toIntOrNull(16), m.value)
+                }
+                token.startsWith("#") -> {
+                    decodeCodePoint(token.substring(1).toIntOrNull(10), m.value)
+                }
+                else -> when (token.lowercase(Locale.ROOT)) {
+                    "lt" -> "<"
+                    "gt" -> ">"
+                    "quot" -> "\""
+                    "apos" -> "'"
+                    "amp" -> "&"
+                    "nbsp" -> " "
+                    "rsquo", "lsquo" -> "'"
+                    "rdquo", "ldquo" -> "\""
+                    "mdash" -> "—"
+                    "ndash" -> "–"
+                    "hellip" -> "…"
+                    else -> m.value
+                }
             }
-            if (code in 1..0x10FFFF) String(Character.toChars(code)) else m.value
+        }
+    }
+
+    private fun decodeCodePoint(code: Int?, fallback: String): String {
+        if (code == null || code !in 1..0x10FFFF || code in 0xD800..0xDFFF) return fallback
+        return String(Character.toChars(code))
+    }
+
+    private fun localName(raw: String?): String {
+        if (raw.isNullOrEmpty()) return ""
+        return raw.substringAfter(':').lowercase(Locale.ROOT)
+    }
+
+    private fun attrValue(parser: XmlPullParser, localAttrName: String): String? {
+        for (i in 0 until parser.attributeCount) {
+            if (localName(parser.getAttributeName(i)) == localAttrName) {
+                return parser.getAttributeValue(i)
+            }
+        }
+        return null
+    }
+
+    private fun scoreLocaleMatch(xmlLang: String, preferredLocale: String): Int {
+        val candidate = xmlLang.trim().replace('_', '-').lowercase(Locale.ROOT)
+        val preferred = preferredLocale.trim().replace('_', '-').lowercase(Locale.ROOT)
+        if (candidate.isEmpty()) return 1
+        if (candidate == preferred) return 4
+        val candLang = candidate.substringBefore('-')
+        val prefLang = preferred.substringBefore('-')
+        if (candLang == prefLang) {
+            // 简体中文偏好加权
+            if (prefLang == "zh" &&
+                (preferred.contains("hans") || preferred.contains("cn") || preferred.contains("sg")) &&
+                (candidate.contains("hans") || candidate.contains("cn") || candidate.contains("sg"))
+            ) {
+                return 3
+            }
+            return 2
+        }
+        return 1
+    }
+
+    private fun appendNormalizedText(sb: StringBuilder, text: String) {
+        val collapsed = WHITESPACE_RE.replace(text, " ")
+        if (collapsed.isEmpty()) return
+        if (collapsed == " ") {
+            appendNormalizedSpace(sb)
+            return
+        }
+        var start = 0
+        if (collapsed[0] == ' ' && (sb.isEmpty() || sb[sb.length - 1] == ' ')) {
+            start = 1
+        }
+        if (start < collapsed.length) {
+            sb.append(collapsed, start, collapsed.length)
+        }
+    }
+
+    private fun appendNormalizedSpace(sb: StringBuilder) {
+        if (sb.isNotEmpty() && sb[sb.length - 1] != ' ') {
+            sb.append(' ')
+        }
+    }
+
+    private fun normalizeWords(
+        words: List<LyricWord>,
+        leadingTrim: Int,
+        textLength: Int
+    ): List<LyricWord> {
+        if (words.isEmpty() || textLength <= 0) return emptyList()
+        val out = ArrayList<LyricWord>(words.size)
+        var lastStart = 0L
+        for (w in words) {
+            val cs = (w.charStart - leadingTrim).coerceIn(0, textLength)
+            val ce = (w.charEnd - leadingTrim).coerceIn(cs, textLength)
+            if (ce <= cs) continue
+            val st = maxOf(w.startMs, lastStart)
+            val en = maxOf(w.endMs, st)
+            out.add(LyricWord(st, en, cs, ce))
+            lastStart = st
         }
         return out
+    }
+
+    private fun backfillMissingEndMs(sorted: List<LyricLine>): List<LyricLine> {
+        if (sorted.isEmpty()) return sorted
+        return sorted.mapIndexed { idx, cur ->
+            if (cur.endMs > cur.startMs) {
+                cur
+            } else {
+                var nextStart = -1L
+                for (j in idx + 1 until sorted.size) {
+                    if (sorted[j].startMs > cur.startMs) {
+                        nextStart = sorted[j].startMs
+                        break
+                    }
+                }
+                val fallbackDuration = if (cur.isBlank) 3_000L else 5_000L
+                val inferredEnd = if (nextStart > cur.startMs) nextStart else cur.startMs + fallbackDuration
+                LyricLine(
+                    startMs = cur.startMs,
+                    endMs = inferredEnd,
+                    text = cur.text,
+                    words = cur.words,
+                    translation = cur.translation,
+                    key = cur.key,
+                    agentId = cur.agentId
+                )
+            }
+        }
+    }
+
+    private fun parseFractionMillis(fracRaw: String): Long {
+        if (fracRaw.isEmpty()) return 0L
+        return when (fracRaw.length) {
+            1 -> (fracRaw.toLongOrNull() ?: 0L) * 100L
+            2 -> (fracRaw.toLongOrNull() ?: 0L) * 10L
+            3 -> fracRaw.toLongOrNull() ?: 0L
+            else -> fracRaw.substring(0, 3).toLongOrNull() ?: 0L
+        }
     }
 }
