@@ -32,7 +32,29 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Decode Release Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -eo pipefail
+          if [[ -n "$KEYSTORE_BASE64" && -n "$KEYSTORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]]; then
+            KS_FILE="$RUNNER_TEMP/wristam-release.jks"
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > "$KS_FILE"
+            keytool -list -v -keystore "$KS_FILE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | grep -E "Alias name:|Valid from:|SHA256:"
+            echo "KEYSTORE_PATH=$KS_FILE" >> "$GITHUB_ENV"
+            echo "Fixed release signing keystore verified."
+          else
+            echo "::warning::Release keystore secrets not fully configured; falling back to ephemeral debug keystore."
+          fi
+
       - name: Build Release APKs
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease --stacktrace
 
       - name: Prepare Release Artifacts
