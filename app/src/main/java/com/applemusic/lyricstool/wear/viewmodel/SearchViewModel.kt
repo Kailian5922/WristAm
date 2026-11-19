@@ -132,11 +132,19 @@ class SearchViewModel(
         val seenSig = HashSet<String>()
         for (batch in perHitLists) {
             for (song in batch) {
-                val idKey = song.providerSongId?.ifBlank { song.id } ?: song.id
+                val rawId = song.id.trim()
+                val primaryId = song.providerSongId?.trim()?.ifBlank { rawId } ?: rawId
                 val sigKey = normalizeSignature(song.title, song.artist)
-                if (seenIds.add(idKey) && seenSig.add(sigKey)) {
-                    merged.add(song)
+                if ((rawId.isNotEmpty() && rawId in seenIds) ||
+                    (primaryId.isNotEmpty() && primaryId in seenIds) ||
+                    sigKey in seenSig
+                ) {
+                    continue
                 }
+                if (rawId.isNotEmpty()) seenIds.add(rawId)
+                if (primaryId.isNotEmpty()) seenIds.add(primaryId)
+                seenSig.add(sigKey)
+                merged.add(song)
                 if (merged.size >= 15) return@coroutineScope merged
             }
         }
@@ -152,7 +160,7 @@ class SearchViewModel(
 
         var catalogError: Throwable? = null
         val catalogSongs = try {
-            MusicRepository.searchCatalog(trimmed, 30).songs
+            MusicRepository.searchCatalog(trimmed, 25).songs
         } catch (e: Exception) {
             catalogError = e
             emptyList()
@@ -163,11 +171,19 @@ class SearchViewModel(
         val seenSignatures = HashSet<String>()
 
         fun addIfUnique(hit: SongHit) {
-            val primaryId = hit.providerSongId?.ifBlank { hit.id } ?: hit.id
+            val rawId = hit.id.trim()
+            val primaryId = hit.providerSongId?.trim()?.ifBlank { rawId } ?: rawId
             val sig = normalizeSignature(hit.title, hit.artist)
-            if (seenIds.add(hit.id) && seenIds.add(primaryId) && seenSignatures.add(sig)) {
-                merged.add(hit)
+            if ((rawId.isNotEmpty() && rawId in seenIds) ||
+                (primaryId.isNotEmpty() && primaryId in seenIds) ||
+                sig in seenSignatures
+            ) {
+                return
             }
+            if (rawId.isNotEmpty()) seenIds.add(rawId)
+            if (primaryId.isNotEmpty()) seenIds.add(primaryId)
+            seenSignatures.add(sig)
+            merged.add(hit)
         }
 
         for (s in localSongs) addIfUnique(s.toSongHit())

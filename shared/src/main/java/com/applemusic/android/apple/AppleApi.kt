@@ -686,9 +686,10 @@ class AppleApi(private val prefs: TokenStore) {
 
     private fun searchOnce(term: String, limit: Int, lang: String, sf: String = effectiveStorefront()): AppleSearchResult {
         val effectiveSf = sf.ifBlank { effectiveStorefront() }
+        val safeLimit = limit.coerceIn(1, 25)
         val enc = encodeQuery(term)
         val path = "/v1/catalog/$effectiveSf/search?term=$enc" +
-            "&types=songs,albums,artists&limit=$limit&l=$lang"
+            "&types=songs,albums,artists&limit=$safeLimit&l=$lang"
         val root = JSONObject(ampGet(path))
         val results = root.optJSONObject("results") ?: JSONObject()
         val out = AppleSearchResult()
@@ -743,19 +744,19 @@ class AppleApi(private val prefs: TokenStore) {
                 if (isrcs.isNotEmpty()) {
                     val byIsrc = getCatalogSongsByIsrcs(isrcs, sf)
                     val orderedPromotions = ArrayList<AppleSong>()
+                    val promotedIds = HashSet<String>()
                     for (cnSong in cnPart.songs) {
                         val key = cnSong.isrc.uppercase(Locale.ROOT)
                         val matched = byIsrc[key] ?: continue
+                        if (!promotedIds.add(matched.id)) continue
                         matched.name = ChineseText.toSimplified(cnSong.name)
                         matched.artistName = ChineseText.toSimplified(cnSong.artistName)
                         matched.albumName = ChineseText.toSimplified(cnSong.albumName)
-                        if (seenSong.add(matched.id)) {
-                            orderedPromotions.add(matched)
-                        } else {
+                        if (!seenSong.add(matched.id)) {
                             // 已存在较低位置：移除旧项后按国区顺位置顶并保留中文化名称
                             merged.songs.removeAll { it.id == matched.id }
-                            orderedPromotions.add(matched)
                         }
+                        orderedPromotions.add(matched)
                     }
                     if (orderedPromotions.isNotEmpty()) {
                         merged.songs.addAll(0, orderedPromotions)
@@ -798,6 +799,7 @@ class AppleApi(private val prefs: TokenStore) {
     fun searchArtistsOnly(term: String, limit: Int): List<AppleArtist> {
         val query = term.trim()
         if (query.isEmpty()) return emptyList()
+        val safeLimit = limit.coerceIn(1, 25)
         val sf = effectiveStorefront()
         val out = ArrayList<AppleArtist>()
         val seen = HashSet<String>()
@@ -805,7 +807,7 @@ class AppleApi(private val prefs: TokenStore) {
         fun queryOnce(q: String, lang: String) {
             try {
                 val enc = encodeQuery(q)
-                val path = "/v1/catalog/$sf/search?term=$enc&types=artists&limit=$limit&l=$lang"
+                val path = "/v1/catalog/$sf/search?term=$enc&types=artists&limit=$safeLimit&l=$lang"
                 val root = JSONObject(ampGet(path))
                 val results = root.optJSONObject("results") ?: JSONObject()
                 for (artist in pickArtists(results.optJSONObject("artists") ?: JSONObject(), "data")) {
