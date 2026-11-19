@@ -3,8 +3,12 @@ package com.applemusic.lyricstool.wear.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.applemusic.lyricstool.data.SongHit
+import com.applemusic.lyricstool.wear.data.ActiveDownload
+import com.applemusic.lyricstool.wear.data.DownloadRepository
 import com.applemusic.lyricstool.wear.data.FavoritesRepository
 import com.applemusic.lyricstool.wear.data.PlaybackRepository
+import com.applemusic.lyricstool.wear.data.SleepTimerRepository
+import com.applemusic.lyricstool.wear.data.SleepTimerState
 import com.applemusic.lyricstool.wear.data.resolveFavoriteCatalogId
 import com.applemusic.lyricstool.wear.data.toSongHit
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,21 +30,30 @@ data class PlayerUiState(
     val currentQueueIndex: Int = -1,
     val isFavorited: Boolean = false,
     val favoritePending: Boolean = false,
-    val seekRevision: Long = 0L
+    val isDownloaded: Boolean = false,
+    val activeDownload: ActiveDownload? = null,
+    val seekRevision: Long = 0L,
+    val sleepTimerEndElapsedMs: Long? = null
 )
 
 class PlayerViewModel(
     private val playbackRepository: PlaybackRepository,
-    private val favoritesRepository: FavoritesRepository
+    private val favoritesRepository: FavoritesRepository,
+    private val sleepTimerRepository: SleepTimerRepository,
+    private val downloadRepository: DownloadRepository
 ) : ViewModel() {
 
     private val resolvedCatalogIds = MutableStateFlow<Map<String, String>>(emptyMap())
 
+    val sleepTimerState: StateFlow<SleepTimerState> = sleepTimerRepository.state
+
     val uiState: StateFlow<PlayerUiState> = combine(
         playbackRepository.stateFlow,
         favoritesRepository.state,
-        resolvedCatalogIds
-    ) { snap, favState, resolvedMap ->
+        resolvedCatalogIds,
+        sleepTimerRepository.state,
+        downloadRepository.state
+    ) { snap, favState, resolvedMap, timerState, dlState ->
         val row = snap.currentSong ?: snap.targetSong
         val song = row?.toSongHit()
         val catId = song?.let { s ->
@@ -57,7 +70,10 @@ class PlayerViewModel(
             currentQueueIndex = if (snap.playingIndex >= 0) snap.playingIndex else snap.queueIndex,
             isFavorited = catId.isNotBlank() && catId in favState.favoritedCatalogIds,
             favoritePending = catId.isNotBlank() && favState.pendingSongId == catId,
-            seekRevision = snap.seekRevision
+            isDownloaded = song != null && dlState.isSongDownloaded(song),
+            activeDownload = song?.let { dlState.activeDownloadFor(it) },
+            seekRevision = snap.seekRevision,
+            sleepTimerEndElapsedMs = timerState.endElapsedRealtimeMs
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlayerUiState())
 
@@ -94,6 +110,20 @@ class PlayerViewModel(
 
     fun playAt(index: Int) {
         playbackRepository.playAt(index)
+    }
+
+    fun startSleepTimer(hours: Int, minutes: Int) {
+        val durationMs = (hours.coerceAtLeast(0) * 60L + minutes.coerceAtLeast(0)) * 60_000L
+        sleepTimerRepository.start(durationMs)
+    }
+
+    fun cancelSleepTimer() {
+        sleepTimerRepository.cancel()
+    }
+
+    fun downloadCurrentSong() {
+        val song = uiState.value.currentSong ?: return
+        downloadRepository.startDownload(song)
     }
 
     fun toggleFavorite(onToast: (String, Boolean) -> Unit) {

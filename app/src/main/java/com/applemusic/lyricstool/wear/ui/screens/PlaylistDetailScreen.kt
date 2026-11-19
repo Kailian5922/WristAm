@@ -1,12 +1,15 @@
 package com.applemusic.lyricstool.wear.ui.screens
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -27,7 +30,12 @@ import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.OutlinedButton
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
+import com.applemusic.lyricstool.wear.data.containsSong
+import com.applemusic.lyricstool.wear.data.findFor
+import com.applemusic.lyricstool.wear.data.toSongHit
+import com.applemusic.lyricstool.wear.ui.components.SongDownloadActionButton
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
+import com.applemusic.lyricstool.wear.ui.components.WearDownloadLinearProgressBar
 import com.applemusic.lyricstool.wear.viewmodel.PlaylistDetailViewModel
 
 @Composable
@@ -109,6 +117,10 @@ fun PlaylistDetailScreen(
                         items = displayed,
                         key = { index, row -> "${row.uri.ifBlank { row.appleId }}_$index" }
                     ) { index, row ->
+                        val hit = row.toSongHit()
+                        val isDownloaded = state.downloadedIds.containsSong(hit)
+                        val activeDownload = state.activeDownloads.findFor(hit)
+
                         Card(
                             onClick = {
                                 viewModel.playFromIndex(index)
@@ -118,20 +130,52 @@ fun PlaylistDetailScreen(
                                 .fillMaxWidth()
                                 .padding(vertical = 2.dp)
                         ) {
-                            Column(modifier = Modifier.padding(8.dp)) {
-                                Text(
-                                    text = row.title,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = row.artist,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = row.title,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = if (activeDownload != null) {
+                                                "${activeDownload.stageLabel} · ${activeDownload.percent.coerceIn(0, 100)}%"
+                                            } else {
+                                                row.artist
+                                            },
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (activeDownload != null) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    SongDownloadActionButton(
+                                        activeDownload = activeDownload,
+                                        isDownloaded = isDownloaded,
+                                        onDownload = { viewModel.downloadSong(hit) }
+                                    )
+                                }
+                                if (activeDownload != null) {
+                                    WearDownloadLinearProgressBar(
+                                        percent = activeDownload.percent,
+                                        barHeight = 3.dp
+                                    )
+                                }
                             }
                         }
                     }

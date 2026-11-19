@@ -12,6 +12,7 @@ class WearViewModelFactory(
         AppViewModel::class.java -> AppViewModel(
             authRepository = container.authRepository,
             playbackRepository = container.playbackRepository,
+            sleepTimerRepository = container.sleepTimerRepository,
             favoritesRepository = container.favoritesRepository,
             downloadRepository = container.downloadRepository,
             libraryRepository = container.libraryRepository
@@ -19,7 +20,9 @@ class WearViewModelFactory(
         AuthViewModel::class.java -> AuthViewModel(container.authRepository) as T
         PlayerViewModel::class.java -> PlayerViewModel(
             playbackRepository = container.playbackRepository,
-            favoritesRepository = container.favoritesRepository
+            favoritesRepository = container.favoritesRepository,
+            sleepTimerRepository = container.sleepTimerRepository,
+            downloadRepository = container.downloadRepository
         ) as T
         LyricsViewModel::class.java -> LyricsViewModel(
             playbackRepository = container.playbackRepository,
@@ -55,7 +58,8 @@ class PlaylistDetailViewModelFactory(
             return PlaylistDetailViewModel(
                 playlistId = playlistId,
                 libraryRepository = container.libraryRepository,
-                playbackRepository = container.playbackRepository
+                playbackRepository = container.playbackRepository,
+                downloadRepository = container.downloadRepository
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
@@ -64,7 +68,8 @@ class PlaylistDetailViewModelFactory(
 
 class ArtistViewModelFactory(
     private val container: WearAppContainer,
-    private val rawArtistParam: String
+    private val rawArtistParam: String,
+    private val directArtistId: String = ""
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -72,7 +77,9 @@ class ArtistViewModelFactory(
             return ArtistViewModel(
                 rawArtistParam = rawArtistParam,
                 artistRepository = container.artistRepository,
-                playbackRepository = container.playbackRepository
+                playbackRepository = container.playbackRepository,
+                downloadRepository = container.downloadRepository,
+                directArtistId = directArtistId
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")

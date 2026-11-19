@@ -44,9 +44,13 @@ import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import coil.compose.AsyncImage
+import com.applemusic.lyricstool.wear.data.containsSong
+import com.applemusic.lyricstool.wear.data.findFor
 import com.applemusic.lyricstool.wear.data.toSongHit
 import com.applemusic.lyricstool.wear.ui.components.HorologistIcons
+import com.applemusic.lyricstool.wear.ui.components.SongDownloadActionButton
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
+import com.applemusic.lyricstool.wear.ui.components.WearDownloadLinearProgressBar
 import com.applemusic.lyricstool.wear.viewmodel.ArtistViewModel
 
 @Composable
@@ -54,7 +58,7 @@ fun ArtistDetailScreen(
     viewModel: ArtistViewModel,
     onClose: () -> Unit,
     onPlayed: () -> Unit,
-    onOpenSimilarArtist: (String) -> Unit,
+    onOpenSimilarArtist: (String, String) -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -257,6 +261,9 @@ fun ArtistDetailScreen(
                     key = { index, song -> "top_${song.id}_$index" }
                 ) { index, song ->
                     val hit = song.toSongHit()
+                    val isDownloaded = state.downloadedIds.containsSong(hit)
+                    val activeDownload = state.activeDownloads.findFor(hit)
+
                     Card(
                         onClick = {
                             val hits = state.topSongs.map { it.toSongHit() }
@@ -267,46 +274,74 @@ fun ArtistDetailScreen(
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)
                     ) {
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
-                            Text(
-                                text = "%02d".format(index + 1),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.width(22.dp)
-                            )
-                            Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    text = song.name,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    text = "%02d".format(index + 1),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.width(20.dp)
                                 )
-                                if (song.albumName.isNotBlank()) {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = song.albumName,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        text = song.name,
+                                        style = MaterialTheme.typography.bodyMedium,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
+                                    val subText = if (activeDownload != null) {
+                                        "${activeDownload.stageLabel} · ${activeDownload.percent.coerceIn(0, 100)}%"
+                                    } else {
+                                        song.albumName
+                                    }
+                                    if (subText.isNotBlank()) {
+                                        Text(
+                                            text = subText,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (activeDownload != null) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                SongDownloadActionButton(
+                                    activeDownload = activeDownload,
+                                    isDownloaded = isDownloaded,
+                                    onDownload = { viewModel.downloadSong(hit) },
+                                    buttonSize = 30.dp
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                FilledIconButton(
+                                    onClick = {
+                                        viewModel.playSong(hit)
+                                        onPlayed()
+                                    },
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = "播放",
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                 }
                             }
-                            FilledIconButton(
-                                onClick = {
-                                    viewModel.playSong(hit)
-                                    onPlayed()
-                                },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(
-                                    Icons.Default.PlayArrow,
-                                    contentDescription = "播放",
-                                    modifier = Modifier.size(18.dp)
+                            if (activeDownload != null) {
+                                WearDownloadLinearProgressBar(
+                                    percent = activeDownload.percent,
+                                    barHeight = 3.dp
                                 )
                             }
                         }
@@ -428,6 +463,9 @@ fun ArtistDetailScreen(
                     key = { index, row -> "local_${row.uri}_$index" }
                 ) { index, row ->
                     val hit = row.toSongHit()
+                    val isDownloaded = state.downloadedIds.containsSong(hit)
+                    val activeDownload = state.activeDownloads.findFor(hit)
+
                     Card(
                         onClick = {
                             val hits = state.localSongs.map { it.toSongHit() }
@@ -438,38 +476,68 @@ fun ArtistDetailScreen(
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)
                     ) {
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalArrangement = Arrangement.spacedBy(5.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = row.title,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = row.album,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            FilledIconButton(
-                                onClick = {
-                                    viewModel.playSong(hit)
-                                    onPlayed()
-                                },
-                                modifier = Modifier.size(32.dp)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(
-                                    Icons.Default.PlayArrow,
-                                    contentDescription = "播放",
-                                    modifier = Modifier.size(18.dp)
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = row.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val subText = if (activeDownload != null) {
+                                        "${activeDownload.stageLabel} · ${activeDownload.percent.coerceIn(0, 100)}%"
+                                    } else {
+                                        row.album
+                                    }
+                                    if (subText.isNotBlank()) {
+                                        Text(
+                                            text = subText,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (activeDownload != null) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                SongDownloadActionButton(
+                                    activeDownload = activeDownload,
+                                    isDownloaded = isDownloaded,
+                                    onDownload = { viewModel.downloadSong(hit) },
+                                    buttonSize = 30.dp
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                FilledIconButton(
+                                    onClick = {
+                                        viewModel.playSong(hit)
+                                        onPlayed()
+                                    },
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = "播放",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                            if (activeDownload != null) {
+                                WearDownloadLinearProgressBar(
+                                    percent = activeDownload.percent,
+                                    barHeight = 3.dp
                                 )
                             }
                         }
@@ -514,7 +582,7 @@ fun ArtistDetailScreen(
                     key = { _, sim -> "sim_${sim.id}_${sim.name}" }
                 ) { _, simArtist ->
                     Card(
-                        onClick = { onOpenSimilarArtist(simArtist.name) },
+                        onClick = { onOpenSimilarArtist(simArtist.name, simArtist.id) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)

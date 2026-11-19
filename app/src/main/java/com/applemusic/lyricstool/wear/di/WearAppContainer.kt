@@ -17,6 +17,7 @@ import com.applemusic.lyricstool.wear.data.LibraryRepository
 import com.applemusic.lyricstool.wear.data.LyricsRepository
 import com.applemusic.lyricstool.wear.data.PlaybackRepository
 import com.applemusic.lyricstool.wear.data.RadioRepository
+import com.applemusic.lyricstool.wear.data.SleepTimerRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -69,6 +70,10 @@ class WearAppContainer(context: Context) {
     val playbackRepository: PlaybackRepository = PlaybackRepository(
         appContext = appContext,
         lyricsRepository = lyricsRepository
+    )
+    val sleepTimerRepository: SleepTimerRepository = SleepTimerRepository(
+        appScope = appScope,
+        playbackRepository = playbackRepository
     )
     val downloadRepository: DownloadRepository = DownloadRepository(
         appContext = appContext,

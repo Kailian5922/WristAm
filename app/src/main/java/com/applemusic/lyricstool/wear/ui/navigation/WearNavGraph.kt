@@ -39,6 +39,7 @@ import com.applemusic.lyricstool.wear.ui.screens.PlaylistsScreen
 import com.applemusic.lyricstool.wear.ui.screens.QueueScreen
 import com.applemusic.lyricstool.wear.ui.screens.RadioStationsScreen
 import com.applemusic.lyricstool.wear.ui.screens.SearchScreen
+import com.applemusic.lyricstool.wear.ui.screens.SleepTimerScreen
 import com.applemusic.lyricstool.wear.ui.theme.HorologistArtworkBackground
 import com.applemusic.lyricstool.wear.ui.theme.HorologistColors
 import com.applemusic.lyricstool.wear.ui.theme.rememberDynamicColorScheme
@@ -138,6 +139,7 @@ fun WearAppRoot(
                                         isVisible = isPlayerVisible,
                                         onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
                                         onOpenArtist = openArtistFlow,
+                                        onOpenSleepTimer = { navController.navigate(WearRoutes.SLEEP_TIMER) },
                                         onToast = appViewModel::showToast
                                     )
                                     1 -> LyricsScreen(
@@ -168,6 +170,14 @@ fun WearAppRoot(
                                 onClose = { navController.popBackStack() }
                             )
                         }
+                    }
+
+                    composable(WearRoutes.SLEEP_TIMER) {
+                        SleepTimerScreen(
+                            playerViewModel = playerViewModel,
+                            onClose = { navController.popBackStack() },
+                            onToast = appViewModel::showToast
+                        )
                     }
 
                     composable(WearRoutes.RADIO) {
@@ -243,7 +253,9 @@ fun WearAppRoot(
                                 viewModel = searchVm,
                                 onBack = { navController.popBackStack() },
                                 onPlayed = returnToPlayer,
-                                onToast = appViewModel::showToast
+                                onOpenArtist = { artistName, artistId ->
+                                    navController.navigate(WearRoutes.artistDetail(artistName, artistId))
+                                }
                             )
                         }
                     }
@@ -284,12 +296,20 @@ fun WearAppRoot(
 
                     composable(
                         route = WearRoutes.ARTIST_DETAIL_PATTERN,
-                        arguments = listOf(navArgument("rawArtists") { type = NavType.StringType })
+                        arguments = listOf(
+                            navArgument("rawArtists") { type = NavType.StringType },
+                            navArgument("artistId") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            }
+                        )
                     ) { entry ->
                         val encoded = entry.arguments?.getString("rawArtists").orEmpty()
                         val rawArtists = remember(encoded) { Uri.decode(encoded) }
-                        val artistFactory = remember(container, rawArtists) {
-                            ArtistViewModelFactory(container, rawArtists)
+                        val encodedArtistId = entry.arguments?.getString("artistId").orEmpty()
+                        val directArtistId = remember(encodedArtistId) { Uri.decode(encodedArtistId) }
+                        val artistFactory = remember(container, rawArtists, directArtistId) {
+                            ArtistViewModelFactory(container, rawArtists, directArtistId)
                         }
                         val artistVm: ArtistViewModel = viewModel(
                             viewModelStoreOwner = entry,
@@ -300,8 +320,8 @@ fun WearAppRoot(
                                 viewModel = artistVm,
                                 onClose = { navController.popBackStack() },
                                 onPlayed = returnToPlayer,
-                                onOpenSimilarArtist = { simName ->
-                                    navController.navigate(WearRoutes.artistDetail(simName))
+                                onOpenSimilarArtist = { simName, simId ->
+                                    navController.navigate(WearRoutes.artistDetail(simName, simId))
                                 },
                                 onToast = appViewModel::showToast
                             )

@@ -5,6 +5,7 @@ import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.android.apple.AppleArtistPage
 import com.applemusic.android.apple.AppleLibrarySync
 import com.applemusic.android.apple.AppleSong
+import com.applemusic.android.apple.ArtistAliasTable
 import com.applemusic.android.apple.MusicRepository
 import com.applemusic.android.apple.PageResult
 import kotlinx.coroutines.Dispatchers
@@ -99,11 +100,18 @@ data class ArtistLoadResult(
 class ArtistRepository {
     private val pageCache = LruCache<String, AppleArtistPage>(8)
 
-    suspend fun loadArtist(artistName: String): ArtistLoadResult = withContext(Dispatchers.IO) {
+    suspend fun loadArtist(
+        artistName: String,
+        preferredArtistId: String = ""
+    ): ArtistLoadResult = withContext(Dispatchers.IO) {
         val localSongs = MusicRepository.songsOfArtist(artistName)
         val api = MusicRepository.api
 
-        var resolvedId = localSongs.firstOrNull { it.artistId.isNotBlank() }?.artistId.orEmpty()
+        var resolvedId = preferredArtistId.trim()
+
+        if (resolvedId.isBlank()) {
+            resolvedId = localSongs.firstOrNull { it.artistId.isNotBlank() }?.artistId.orEmpty()
+        }
 
         if (resolvedId.isBlank()) {
             val anyCatalogId = localSongs.firstOrNull { it.catalogId.isNotBlank() }?.catalogId.orEmpty()
@@ -114,10 +122,13 @@ class ArtistRepository {
 
         if (resolvedId.isBlank()) {
             val searchArtists = api.searchArtistsOnly(artistName, 5)
-            resolvedId = searchArtists.firstOrNull {
-                it.name.equals(artistName, ignoreCase = true)
-            }?.id.orEmpty().ifBlank {
-                searchArtists.firstOrNull()?.id.orEmpty()
+            val exact = api.resolveExactArtists(artistName, searchArtists, maxResults = 1)
+            resolvedId = exact.firstOrNull()?.id.orEmpty().ifBlank {
+                searchArtists.firstOrNull {
+                    ArtistAliasTable.matchesArtistName(it.name, artistName)
+                }?.id.orEmpty().ifBlank {
+                    searchArtists.firstOrNull()?.id.orEmpty()
+                }
             }
         }
 

@@ -62,7 +62,7 @@ jobs:
           mkdir -p release-apks
           TAG_NAME="${GITHUB_REF_NAME}"
           if [[ -z "$TAG_NAME" || "$TAG_NAME" == "main" || "$TAG_NAME" == "master" ]]; then
-            TAG_NAME="v2.0.3"
+            TAG_NAME="v2.0.4"
           fi
           
           cp app/build/outputs/apk/release/app-release.apk "release-apks/WristAm-Wear-${TAG_NAME}.apk"
@@ -80,8 +80,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.0.3' }}
-          name: "WristAm ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.0.3' }}"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.0.4' }}
+          name: "WristAm ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v2.0.4' }}"
           draft: false
           prerelease: false
           generate_release_notes: true

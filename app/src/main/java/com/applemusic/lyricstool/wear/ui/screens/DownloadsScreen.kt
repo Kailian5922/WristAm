@@ -3,7 +3,6 @@ package com.applemusic.lyricstool.wear.ui.screens
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -15,8 +14,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,14 +29,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.TransformingLazyColumn
 import androidx.wear.compose.foundation.lazy.itemsIndexed
 import androidx.wear.compose.foundation.lazy.rememberTransformingLazyColumnState
 import androidx.wear.compose.material3.ButtonDefaults
 import androidx.wear.compose.material3.Card
-import androidx.wear.compose.material3.CircularProgressIndicator
 import androidx.wear.compose.material3.FilledIconButton
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.FilledTonalIconButton
@@ -43,13 +42,13 @@ import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.IconButtonDefaults
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.MaterialTheme
-import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import com.applemusic.android.apple.AppleCache
 import com.applemusic.lyricstool.wear.ui.components.HorologistIcons
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
 import com.applemusic.lyricstool.wear.ui.components.WearConfirmDialog
+import com.applemusic.lyricstool.wear.ui.components.WearDownloadLinearProgressBar
 import com.applemusic.lyricstool.wear.viewmodel.DownloadCategory
 import com.applemusic.lyricstool.wear.viewmodel.DownloadsViewModel
 
@@ -97,63 +96,20 @@ fun DownloadsScreen(
             }
 
             if (state.selectedArtist == null && state.selectedAlbum == null) {
-                item(key = "dl_tabs") {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(vertical = 4.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        listOf(
-                            DownloadCategory.All to "全部 (${state.entries.size})",
-                            DownloadCategory.ByArtist to "按歌手",
-                            DownloadCategory.ByAlbum to "按专辑"
-                        ).forEach { (cat, label) ->
-                            val isSelected = state.category == cat
-                            FilledTonalButton(
-                                onClick = { viewModel.selectCategory(cat) },
-                                modifier = Modifier
-                                    .padding(horizontal = 3.dp)
-                                    .height(30.dp),
-                                colors = ButtonDefaults.filledTonalButtonColors(
-                                    containerColor = if (isSelected) {
-                                        MaterialTheme.colorScheme.primaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surfaceContainer
-                                    },
-                                    contentColor = if (isSelected) {
-                                        MaterialTheme.colorScheme.onPrimaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    }
-                                )
-                            ) {
-                                Text(
-                                    text = label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // 正在下载中的实时任务卡片
+                // 正在下载中的实时任务卡片（置顶展示，进入“已下载歌曲”即可一眼查看进度）
                 if (state.activeDownloads.isNotEmpty()) {
                     item(key = "dl_active_hdr") {
                         ListHeader(modifier = Modifier.fillMaxWidth()) {
                             Text(
                                 "正在下载 (${state.activeDownloads.size})",
-                                style = MaterialTheme.typography.labelSmall,
+                                style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.primary
                             )
                         }
                     }
                     itemsIndexed(
                         items = state.activeDownloads,
-                        key = { _, dl -> "active_${dl.song.id}" }
+                        key = { index, dl -> "active_${dl.taskId}_$index" }
                     ) { _, dl ->
                         Card(
                             onClick = {},
@@ -161,41 +117,191 @@ fun DownloadsScreen(
                                 .fillMaxWidth()
                                 .padding(vertical = 2.dp)
                         ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = dl.song.title.ifBlank { "未知歌曲" },
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (dl.song.artist.isNotBlank()) {
+                                            Text(
+                                                text = dl.song.artist,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    FilledTonalIconButton(
+                                        onClick = { viewModel.cancelDownload(dl.taskId) },
+                                        modifier = Modifier.size(28.dp),
+                                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "取消下载",
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = dl.stageLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = "${dl.percent.coerceIn(0, 100)}%",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                WearDownloadLinearProgressBar(
+                                    percent = dl.percent,
+                                    barHeight = 5.dp
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 最近下载失败记录（支持一键重试或移除）
+                if (state.failedDownloads.isNotEmpty()) {
+                    item(key = "dl_failed_hdr") {
+                        ListHeader(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                "下载失败 (${state.failedDownloads.size})",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                    itemsIndexed(
+                        items = state.failedDownloads,
+                        key = { index, failed -> "failed_${failed.taskId}_$index" }
+                    ) { _, failed ->
+                        Card(
+                            onClick = { viewModel.retryFailed(failed.taskId) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp)
+                        ) {
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(8.dp),
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = dl.song.title,
+                                        text = failed.song.title.ifBlank { "未知歌曲" },
                                         style = MaterialTheme.typography.bodyMedium,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "${dl.stageLabel} · ${dl.percent}%",
+                                        text = failed.reason,
                                         style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary
+                                        color = MaterialTheme.colorScheme.error,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
-                                Box(
+                                Spacer(modifier = Modifier.width(4.dp))
+                                FilledTonalIconButton(
+                                    onClick = { viewModel.retryFailed(failed.taskId) },
                                     modifier = Modifier.size(30.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    CircularProgressIndicator(
-                                        progress = { (dl.percent / 100f).coerceIn(0.05f, 1f) },
-                                        modifier = Modifier.fillMaxSize(),
-                                        strokeWidth = 2.dp,
-                                        colors = ProgressIndicatorDefaults.colors(
-                                            indicatorColor = MaterialTheme.colorScheme.primary
-                                        )
+                                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
                                     )
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "重试下载",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                FilledTonalIconButton(
+                                    onClick = { viewModel.dismissFailed(failed.taskId) },
+                                    modifier = Modifier.size(28.dp),
+                                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "忽略失败记录",
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (state.entries.isNotEmpty()) {
+                    item(key = "dl_tabs") {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            listOf(
+                                DownloadCategory.All to "全部 (${state.entries.size})",
+                                DownloadCategory.ByArtist to "按歌手",
+                                DownloadCategory.ByAlbum to "按专辑"
+                            ).forEach { (cat, label) ->
+                                val isSelected = state.category == cat
+                                FilledTonalButton(
+                                    onClick = { viewModel.selectCategory(cat) },
+                                    modifier = Modifier
+                                        .padding(horizontal = 3.dp)
+                                        .height(30.dp),
+                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = if (isSelected) {
+                                            MaterialTheme.colorScheme.primaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceContainer
+                                        },
+                                        contentColor = if (isSelected) {
+                                            MaterialTheme.colorScheme.onPrimaryContainer
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                ) {
                                     Text(
-                                        text = "${dl.percent}",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
-                                        color = MaterialTheme.colorScheme.primary
+                                        text = label,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                                     )
                                 }
                             }
@@ -205,26 +311,28 @@ fun DownloadsScreen(
             }
 
             if (state.entries.isEmpty()) {
-                item(key = "dl_empty") {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Icon(
-                            imageVector = HorologistIcons.Download,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(32.dp)
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = "暂无已下载歌曲\n在搜索页可点击下载图标离线保存",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center
-                        )
+                if (state.activeDownloads.isEmpty() && state.failedDownloads.isEmpty()) {
+                    item(key = "dl_empty") {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = HorologistIcons.Download,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "暂无已下载歌曲\n可在播放页、搜索页、歌单或歌手页点击下载离线保存",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+                        }
                     }
                 }
             } else {

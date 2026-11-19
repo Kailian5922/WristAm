@@ -755,6 +755,39 @@ object PlaybackEngine {
         }
     }
 
+    /** 显式暂停播放（如睡眠定时结束）：同时取消在途准备任务与续播标记，防止缓冲完成后意外恢复播放。 */
+    fun pause() {
+        val runPause = Runnable {
+            val wasPreparing = preparing
+            if (wasPreparing) {
+                playGeneration.incrementAndGet()
+                activePrepareFuture?.cancel(true)
+                activePrepareFuture = null
+                preparing = false
+                preparingNote = ""
+            }
+            val mismatchIndex = synchronized(queue) {
+                skipPendingForQueueContinuation = false
+                playingIndex != queueIndex
+            }
+            restorePlayWhenReady = false
+            player?.let { p ->
+                p.pause()
+                if (wasPreparing && mismatchIndex) {
+                    p.stop()
+                    p.clearMediaItems()
+                }
+            }
+            persistQueueState()
+            dispatchStateChanged()
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runPause.run()
+        } else {
+            main.post(runPause)
+        }
+    }
+
     fun seekTo(ms: Long) {
         val targetMs = ms.coerceAtLeast(0L)
         if (pendingPlaybackRestore) {

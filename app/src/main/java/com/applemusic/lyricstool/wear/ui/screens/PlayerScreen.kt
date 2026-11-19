@@ -3,7 +3,10 @@ package com.applemusic.lyricstool.wear.ui.screens
 import android.content.Context
 import android.content.res.Configuration
 import android.media.AudioManager
+import android.os.SystemClock
+import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,15 +15,19 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -33,6 +40,7 @@ import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -54,6 +62,7 @@ import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import com.applemusic.lyricstool.R
+import com.applemusic.lyricstool.wear.data.formatSleepTimerCountdown
 import com.applemusic.lyricstool.wear.ui.components.HorologistIcons
 import com.applemusic.lyricstool.wear.ui.components.HorologistPlayPauseProgressButton
 import com.applemusic.lyricstool.wear.viewmodel.PlayerViewModel
@@ -69,8 +78,8 @@ private fun Configuration.getScreenSizeInDpFromPercentage(percent: Float): Dp =
 /**
  * 严格保持 Google Horologist 播放器视觉布局：
  * - TopSection：跑马灯歌名 + 可点击进入歌手主页的强调色艺人名；
- * - MiddleSection：上一首 + 10-scallop 波浪形变进度播放/暂停按钮 + 下一首；
- * - BottomSection：缓冲状态 或 播放队列 & 收藏快捷按钮；
+ * - MiddleSection：上一首 + 10-scallop 波浪形变进度播放/暂停按钮（长按进入定时播放）+ 下一首；
+ * - BottomSection：缓冲状态 或 播放队列、离线下载进度与收藏快捷按钮；
  * - 表冠旋转调节媒体音量 + 零多余重组的绘制期进度更新。
  */
 @Composable
@@ -79,6 +88,7 @@ fun PlayerScreen(
     isVisible: Boolean,
     onOpenQueue: () -> Unit,
     onOpenArtist: (String) -> Unit,
+    onOpenSleepTimer: () -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -270,7 +280,9 @@ fun PlayerScreen(
                             isPlaying = state.isPlaying,
                             isPreparing = state.isPreparing,
                             progressProvider = { progressState.floatValue },
-                            onToggle = viewModel::togglePlayPause
+                            onToggle = viewModel::togglePlayPause,
+                            onLongClick = onOpenSleepTimer,
+                            onLongClickLabel = "定时播放"
                         )
 
                         FilledIconButton(
@@ -288,9 +300,21 @@ fun PlayerScreen(
                             )
                         }
                     }
+
+                    state.sleepTimerEndElapsedMs?.let { endElapsedMs ->
+                        SleepTimerBadge(
+                            endElapsedRealtimeMs = endElapsedMs,
+                            isVisible = isVisible,
+                            isAppResumed = isAppResumed,
+                            onClick = onOpenSleepTimer,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .offset(y = 2.dp)
+                        )
+                    }
                 }
 
-                // Bottom Section (Preparing note / Queue & Favorite)
+                // Bottom Section (Preparing note / Queue, Download & Favorite)
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -315,13 +339,14 @@ fun PlayerScreen(
                             modifier = Modifier.padding(horizontal = 16.dp)
                         )
                     } else {
+                        val activeDownload = state.activeDownload
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             FilledTonalIconButton(
                                 onClick = onOpenQueue,
-                                modifier = Modifier.size(44.dp),
+                                modifier = Modifier.size(40.dp),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                     contentColor = MaterialTheme.colorScheme.onSurface
@@ -330,13 +355,65 @@ fun PlayerScreen(
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_baseline_queue_music_24),
                                     contentDescription = "播放列表",
-                                    modifier = Modifier.size(22.dp)
+                                    modifier = Modifier.size(20.dp)
                                 )
+                            }
+                            FilledTonalIconButton(
+                                onClick = viewModel::downloadCurrentSong,
+                                enabled = state.currentSong != null,
+                                modifier = Modifier.size(40.dp),
+                                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                    containerColor = if (state.isDownloaded && activeDownload == null) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainer
+                                    },
+                                    contentColor = if (state.isDownloaded && activeDownload == null) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                            ) {
+                                if (activeDownload != null) {
+                                    val percent = activeDownload.percent.coerceIn(0, 100)
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            progress = { (percent / 100f).coerceIn(0.05f, 1f) },
+                                            modifier = Modifier.size(34.dp),
+                                            strokeWidth = 2.5.dp,
+                                            colors = ProgressIndicatorDefaults.colors(
+                                                indicatorColor = MaterialTheme.colorScheme.primary
+                                            )
+                                        )
+                                        Text(
+                                            text = if (percent >= 100) "100" else "$percent%",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold
+                                            ),
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                } else {
+                                    Icon(
+                                        imageVector = if (state.isDownloaded) {
+                                            HorologistIcons.DownloadDone
+                                        } else {
+                                            HorologistIcons.Download
+                                        },
+                                        contentDescription = if (state.isDownloaded) "已下载" else "下载当前歌曲",
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
                             }
                             FilledTonalIconButton(
                                 onClick = { viewModel.toggleFavorite(onToast) },
                                 enabled = !state.favoritePending && state.currentSong != null,
-                                modifier = Modifier.size(44.dp),
+                                modifier = Modifier.size(40.dp),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = if (state.isFavorited) {
                                         MaterialTheme.colorScheme.primaryContainer
@@ -371,7 +448,7 @@ fun PlayerScreen(
                                         } else {
                                             MaterialTheme.colorScheme.onSurface
                                         },
-                                        modifier = Modifier.size(22.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }
@@ -380,5 +457,61 @@ fun PlayerScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SleepTimerBadge(
+    endElapsedRealtimeMs: Long,
+    isVisible: Boolean,
+    isAppResumed: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var remainingMs by remember(endElapsedRealtimeMs) {
+        mutableLongStateOf((endElapsedRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
+    }
+
+    LaunchedEffect(endElapsedRealtimeMs, isVisible, isAppResumed) {
+        remainingMs = (endElapsedRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        if (!isVisible || !isAppResumed) return@LaunchedEffect
+        while (remainingMs > 0L) {
+            delay(1000L)
+            remainingMs = (endElapsedRealtimeMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        }
+    }
+
+    if (remainingMs <= 0L) return
+
+    val badgeShape = RoundedCornerShape(50)
+    Row(
+        modifier = modifier
+            .clip(badgeShape)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f))
+            .border(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.55f),
+                shape = badgeShape
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 7.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = Icons.Default.Timer,
+            contentDescription = "定时播放",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(11.dp)
+        )
+        Text(
+            text = formatSleepTimerCountdown(remainingMs),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 10.sp,
+                lineHeight = 12.sp
+            ),
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1
+        )
     }
 }

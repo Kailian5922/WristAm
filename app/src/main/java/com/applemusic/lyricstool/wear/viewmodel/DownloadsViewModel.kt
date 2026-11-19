@@ -6,6 +6,7 @@ import com.applemusic.android.apple.AppleCache
 import com.applemusic.lyricstool.data.SongHit
 import com.applemusic.lyricstool.wear.data.ActiveDownload
 import com.applemusic.lyricstool.wear.data.DownloadRepository
+import com.applemusic.lyricstool.wear.data.FailedDownload
 import com.applemusic.lyricstool.wear.data.PlaybackRepository
 import com.applemusic.lyricstool.wear.data.toSongHit
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +27,7 @@ data class DownloadsUiState(
     val category: DownloadCategory = DownloadCategory.All,
     val entries: List<AppleCache.Entry> = emptyList(),
     val activeDownloads: List<ActiveDownload> = emptyList(),
+    val failedDownloads: List<FailedDownload> = emptyList(),
     val totalBytes: Long = 0L,
     val selectedArtist: String? = null,
     val selectedAlbum: String? = null
@@ -58,7 +60,8 @@ class DownloadsViewModel(
         DownloadsUiState(
             category = f.category,
             entries = dl.entries,
-            activeDownloads = dl.activeDownloads.values.toList(),
+            activeDownloads = dl.activeDownloads.values.sortedBy { it.startedAtMs },
+            failedDownloads = dl.failedDownloads.values.sortedByDescending { it.failedAtMs },
             totalBytes = dl.totalBytes,
             selectedArtist = validArtist,
             selectedAlbum = validAlbum
@@ -90,6 +93,18 @@ class DownloadsViewModel(
         } else {
             false
         }
+    }
+
+    fun cancelDownload(songId: String) {
+        downloadRepository.cancelDownload(songId)
+    }
+
+    fun retryFailed(songId: String) {
+        downloadRepository.retryFailed(songId)
+    }
+
+    fun dismissFailed(songId: String) {
+        downloadRepository.dismissFailed(songId)
     }
 
     fun playEntry(entry: AppleCache.Entry) {

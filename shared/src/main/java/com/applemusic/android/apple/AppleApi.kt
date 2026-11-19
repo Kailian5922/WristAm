@@ -715,6 +715,7 @@ class AppleApi(private val prefs: TokenStore) {
 
         val langs = LinkedHashSet<String>().apply {
             add(lang)
+            if (ArtistAliasTable.hasJapaneseKana(query)) add("ja-JP")
             if (hasHanCharacters(query) || sf == "cn") add("zh-Hans-CN")
             add("en-US")
         }
@@ -740,6 +741,11 @@ class AppleApi(private val prefs: TokenStore) {
             try {
                 val cnPart = searchOnce(query, limit = 15, lang = "zh-Hans-CN", sf = "cn")
                 succeeded++
+                for (cnArtist in cnPart.artists) {
+                    if (cnArtist.id.isNotBlank() && seenArtist.add(cnArtist.id)) {
+                        merged.artists.add(cnArtist)
+                    }
+                }
                 val isrcs = cnPart.songs.mapNotNull { it.isrc.takeIf(String::isNotBlank) }.distinct()
                 if (isrcs.isNotEmpty()) {
                     val byIsrc = getCatalogSongsByIsrcs(isrcs, sf)
@@ -768,18 +774,44 @@ class AppleApi(private val prefs: TokenStore) {
             }
         }
 
-        val alias = ArtistAliasTable.lookup(query)
+        val primaryHasExactArtist = merged.artists.any {
+            ArtistAliasTable.matchesArtistName(it.name, query)
+        }
+        val alias = ArtistAliasTable.lookup(query).ifBlank {
+            if (!primaryHasExactArtist || merged.songs.size < 5) {
+                ArtistAliasTable.alternateSearchTerms(query).firstOrNull().orEmpty()
+            } else {
+                ""
+            }
+        }
         if (alias.isNotEmpty() && !alias.equals(query, ignoreCase = true)) {
+            val aliasLang = when {
+                ArtistAliasTable.hasHanCharacters(alias) -> "zh-Hans-CN"
+                ArtistAliasTable.hasJapaneseKana(alias) -> "ja-JP"
+                else -> "en-US"
+            }
             try {
-                val mapped = searchOnce(alias, limit, "en-US", sf)
+                val mapped = searchOnce(alias, limit, aliasLang, sf)
                 succeeded++
                 val fa = mapped.artists.filter { seenArtist.add(it.id) }
                 val fb = mapped.albums.filter { seenAlbum.add(it.id) }
                 val fs = mapped.songs.filter { seenSong.add(it.id) }
-                merged.artists.addAll(0, fa)
-                merged.albums.addAll(0, fb)
-                merged.songs.addAll(0, fs)
-                Logx.i(TAG, "alias search: $query -> $alias (artists=${fa.size})")
+                if (primaryHasExactArtist) {
+                    merged.artists.addAll(fa)
+                } else {
+                    val (exactFa, otherFa) = fa.partition {
+                        ArtistAliasTable.matchesArtistName(it.name, query)
+                    }
+                    merged.artists.addAll(0, exactFa)
+                    merged.artists.addAll(otherFa)
+                }
+                merged.albums.addAll(fb)
+                if (merged.songs.size < 5) {
+                    merged.songs.addAll(0, fs)
+                } else {
+                    merged.songs.addAll(fs)
+                }
+                Logx.i(TAG, "alias search: $query -> $alias ($aliasLang, artists=${fa.size})")
             } catch (e: Throwable) {
                 if (firstError == null) firstError = e
                 Logx.w(TAG, "alias search failed $alias: ${e.message}")
@@ -795,37 +827,259 @@ class AppleApi(private val prefs: TokenStore) {
         return merged
     }
 
-    /** 只搜艺人（含对照表与英文兜底，适配跨区账号）。 */
+    /** 批量按目录艺人 ID 拉取指定语言下的艺人名称、曲风与官方头像。 */
+    fun getCatalogArtistsByIds(
+        artistIds: List<String>,
+        lang: String = langTag(),
+        targetStorefront: String = effectiveStorefront()
+    ): Map<String, AppleArtist> {
+        val cleanIds = artistIds.map { it.trim() }
+            .filter { it.isNotBlank() && it.matches(Regex("[A-Za-z0-9._-]+")) }
+            .distinct()
+        if (cleanIds.isEmpty()) return emptyMap()
+        val sf = targetStorefront.ifBlank { effectiveStorefront() }
+        val out = LinkedHashMap<String, AppleArtist>()
+        for (chunk in cleanIds.chunked(25)) {
+            try {
+                val raw = ampGet("/v1/catalog/$sf/artists?ids=${chunk.joinToString(",")}&l=$lang")
+                val parsed = pickArtists(JSONObject(raw), "data")
+                for (artist in parsed) {
+                    if (artist.id.isNotBlank()) {
+                        out[artist.id] = artist
+                    }
+                }
+            } catch (e: Throwable) {
+                Logx.w(TAG, "getCatalogArtistsByIds failed ($sf/$lang): ${e.message}")
+            }
+        }
+        return out
+    }
+
+    /** 只搜艺人（含双向中英对照表、日语假名与跨区兜底，适配跨区账号）。 */
     fun searchArtistsOnly(term: String, limit: Int): List<AppleArtist> {
         val query = term.trim()
         if (query.isEmpty()) return emptyList()
         val safeLimit = limit.coerceIn(1, 25)
         val sf = effectiveStorefront()
+        val primaryLang = langTag(sf)
         val out = ArrayList<AppleArtist>()
         val seen = HashSet<String>()
 
-        fun queryOnce(q: String, lang: String) {
+        fun queryOnce(q: String, lang: String, targetSf: String = sf) {
             try {
                 val enc = encodeQuery(q)
-                val path = "/v1/catalog/$sf/search?term=$enc&types=artists&limit=$safeLimit&l=$lang"
+                val path = "/v1/catalog/$targetSf/search?term=$enc&types=artists&limit=$safeLimit&l=$lang"
                 val root = JSONObject(ampGet(path))
                 val results = root.optJSONObject("results") ?: JSONObject()
                 for (artist in pickArtists(results.optJSONObject("artists") ?: JSONObject(), "data")) {
-                    if (seen.add(artist.id)) out.add(artist)
+                    if (artist.id.isNotBlank() && seen.add(artist.id)) out.add(artist)
                 }
             } catch (e: Throwable) {
-                Logx.w(TAG, "searchArtistsOnly failed $q ($lang): ${e.message}")
+                Logx.w(TAG, "searchArtistsOnly failed $q ($targetSf/$lang): ${e.message}")
             }
         }
 
-        queryOnce(query, langTag(sf))
-        val alias = ArtistAliasTable.lookup(query)
-        if (alias.isNotEmpty() && !alias.equals(query, ignoreCase = true)) {
-            queryOnce(alias, "en-US")
-        } else if (out.isEmpty() && langTag(sf) != "en-US") {
+        queryOnce(query, primaryLang)
+        if (ArtistAliasTable.hasJapaneseKana(query) && primaryLang != "ja-JP" &&
+            out.none { ArtistAliasTable.matchesArtistName(it.name, query) }
+        ) {
+            queryOnce(query, "ja-JP")
+        }
+        if (sf != "cn" && hasHanCharacters(query) &&
+            out.none { ArtistAliasTable.matchesArtistName(it.name, query) }
+        ) {
+            queryOnce(query, "zh-Hans-CN", "cn")
+        }
+
+        val altTerm = ArtistAliasTable.alternateSearchTerms(query).firstOrNull().orEmpty()
+        if (altTerm.isNotEmpty() && !altTerm.equals(query, ignoreCase = true) &&
+            out.none { ArtistAliasTable.matchesArtistName(it.name, query) }
+        ) {
+            val altLang = when {
+                ArtistAliasTable.hasHanCharacters(altTerm) -> "zh-Hans-CN"
+                ArtistAliasTable.hasJapaneseKana(altTerm) -> "ja-JP"
+                else -> "en-US"
+            }
+            queryOnce(altTerm, altLang)
+        } else if (out.isEmpty() && primaryLang != "en-US") {
             queryOnce(query, "en-US")
         }
         return out
+    }
+
+    /**
+     * 精准匹配歌手（支持中文名与英文名双向精准匹配、日语歌手原名精准匹配），并补全官方头像。
+     */
+    fun resolveExactArtists(
+        term: String,
+        initialCandidates: List<AppleArtist> = emptyList(),
+        maxResults: Int = 3
+    ): List<AppleArtist> {
+        val query = term.trim()
+        val targetKeys = ArtistAliasTable.exactTargetKeys(query)
+        if (targetKeys.isEmpty()) return emptyList()
+
+        val sf = effectiveStorefront()
+        val primaryLang = langTag(sf)
+
+        val orderedCandidates = ArrayList<AppleArtist>()
+        val candidateById = LinkedHashMap<String, AppleArtist>()
+
+        fun ingestCandidates(list: List<AppleArtist>) {
+            for (artist in list) {
+                if (artist.name.isBlank()) continue
+                if (artist.id.isNotBlank()) {
+                    val existing = candidateById[artist.id]
+                    if (existing == null) {
+                        val copy = artist.copy()
+                        candidateById[artist.id] = copy
+                        orderedCandidates.add(copy)
+                    } else {
+                        if (existing.artworkUrl.isBlank() && artist.artworkUrl.isNotBlank()) {
+                            existing.artworkUrl = artist.artworkUrl
+                        }
+                        if (existing.genreNames.isEmpty() && artist.genreNames.isNotEmpty()) {
+                            existing.genreNames = artist.genreNames
+                        }
+                    }
+                } else {
+                    orderedCandidates.add(artist.copy())
+                }
+            }
+        }
+
+        ingestCandidates(initialCandidates)
+
+        val matchedByKey = LinkedHashMap<String, AppleArtist>()
+
+        fun collectDirectMatches(pool: List<AppleArtist>) {
+            for (artist in pool) {
+                val dedupKey = artist.id.ifBlank { "name:${ArtistAliasTable.normalizeKey(artist.name)}" }
+                if (dedupKey in matchedByKey) continue
+                if (ArtistAliasTable.matchesTargetKeys(artist.name, targetKeys)) {
+                    matchedByKey[dedupKey] = artist
+                }
+            }
+        }
+
+        // Pass 1：直接匹配当前候选列表（覆盖原名 + ArtistAliasTable 双向中英映射 + 简繁/新字体/标点归一化）
+        collectDirectMatches(orderedCandidates)
+
+        // Pass 2：若尚无精准命中，仅在候选为空或存在跨语种别名词时补充一次艺人专用搜索
+        if (matchedByKey.isEmpty()) {
+            val altTerms = ArtistAliasTable.alternateSearchTerms(query)
+            if (orderedCandidates.isEmpty()) {
+                ingestCandidates(searchArtistsOnly(query, 8))
+                collectDirectMatches(orderedCandidates)
+            }
+            if (matchedByKey.isEmpty() && altTerms.isNotEmpty()) {
+                val alt = altTerms.first()
+                val altLang = when {
+                    ArtistAliasTable.hasHanCharacters(alt) -> "zh-Hans-CN"
+                    ArtistAliasTable.hasJapaneseKana(alt) -> "ja-JP"
+                    else -> "en-US"
+                }
+                try {
+                    val enc = encodeQuery(alt)
+                    val path = "/v1/catalog/$sf/search?term=$enc&types=artists&limit=8&l=$altLang"
+                    val root = JSONObject(ampGet(path))
+                    val results = root.optJSONObject("results") ?: JSONObject()
+                    ingestCandidates(pickArtists(results.optJSONObject("artists") ?: JSONObject(), "data"))
+                    collectDirectMatches(orderedCandidates)
+                } catch (e: Throwable) {
+                    Logx.w(TAG, "resolveExactArtists alt search failed $alt: ${e.message}")
+                }
+            }
+        }
+
+        // Pass 3：未收录在别名表中的歌手，利用 Apple Music 多语言目录批量校验候选艺人 ID 的真实双语/日语名
+        if (matchedByKey.isEmpty() && orderedCandidates.isNotEmpty()) {
+            val queryHasHan = ArtistAliasTable.hasHanCharacters(query)
+            val queryHasKana = ArtistAliasTable.hasJapaneseKana(query)
+            val queryHasLatin = ArtistAliasTable.hasLatinLetters(query)
+
+            val probeIds = orderedCandidates
+                .asSequence()
+                .filter { it.id.isNotBlank() }
+                .take(8)
+                .filter { candidate ->
+                    val candHasHan = ArtistAliasTable.hasHanCharacters(candidate.name)
+                    val candHasKana = ArtistAliasTable.hasJapaneseKana(candidate.name)
+                    val candHasLatin = ArtistAliasTable.hasLatinLetters(candidate.name)
+                    when {
+                        // 查日语假名：校验 ja-JP（例如国区返回中文译名「宇多田光」，ja-JP 返回「宇多田ヒカル」）
+                        queryHasKana -> primaryLang != "ja-JP" || !candHasKana
+                        // 查英文/拉丁名，而候选含汉字或假名（例如国区返回「告五人」，en-US 返回「Accusefive」）
+                        queryHasLatin && !queryHasHan && !queryHasKana -> candHasHan || candHasKana
+                        // 查汉字（中文名或纯汉字日语名），而候选不含汉字（例如美区返回「Accusefive」/「Fujii Kaze」）
+                        queryHasHan -> !candHasHan || (primaryLang != "zh-Hans-CN" && candHasLatin)
+                        else -> false
+                    }
+                }
+                .map { it.id }
+                .distinct()
+                .take(6)
+                .toList()
+
+            if (probeIds.isNotEmpty()) {
+                val probeLangs = LinkedHashSet<String>()
+                when {
+                    queryHasKana -> probeLangs.add("ja-JP")
+                    queryHasLatin && !queryHasHan -> probeLangs.add("en-US")
+                    queryHasHan -> {
+                        if (primaryLang != "zh-Hans-CN") probeLangs.add("zh-Hans-CN")
+                        probeLangs.add("ja-JP")
+                    }
+                }
+                for (probeLang in probeLangs) {
+                    if (matchedByKey.isNotEmpty()) break
+                    val localizedMap = getCatalogArtistsByIds(probeIds, lang = probeLang, targetStorefront = sf)
+                    for (id in probeIds) {
+                        val localized = localizedMap[id] ?: continue
+                        if (ArtistAliasTable.matchesTargetKeys(localized.name, targetKeys)) {
+                            val base = candidateById[id] ?: localized
+                            if (base.artworkUrl.isBlank() && localized.artworkUrl.isNotBlank()) {
+                                base.artworkUrl = localized.artworkUrl
+                            }
+                            if (base.genreNames.isEmpty() && localized.genreNames.isNotEmpty()) {
+                                base.genreNames = localized.genreNames
+                            }
+                            matchedByKey[id] = base
+                        }
+                    }
+                }
+            }
+        }
+
+        if (matchedByKey.isEmpty()) return emptyList()
+
+        // Pass 4：为精准命中的艺人补齐缺失的官方头像与元数据
+        val missingMetaIds = matchedByKey.values
+            .filter { it.id.isNotBlank() && (it.artworkUrl.isBlank() || it.name.isBlank()) }
+            .map { it.id }
+            .distinct()
+        if (missingMetaIds.isNotEmpty()) {
+            val enriched = getCatalogArtistsByIds(missingMetaIds, lang = primaryLang, targetStorefront = sf)
+            for (artist in matchedByKey.values) {
+                val fresh = enriched[artist.id] ?: continue
+                if (artist.artworkUrl.isBlank() && fresh.artworkUrl.isNotBlank()) {
+                    artist.artworkUrl = fresh.artworkUrl
+                }
+                if (artist.genreNames.isEmpty() && fresh.genreNames.isNotEmpty()) {
+                    artist.genreNames = fresh.genreNames
+                }
+                if (artist.name.isBlank() && fresh.name.isNotBlank()) {
+                    artist.name = fresh.name
+                }
+            }
+        }
+
+        return matchedByKey.values
+            .sortedWith(
+                compareByDescending<AppleArtist> { it.artworkUrl.isNotBlank() }
+                    .thenByDescending { it.id.isNotBlank() }
+            )
+            .take(maxResults)
     }
 
     /** 目录艺人详情（使用当前账号真实区服，避免非国区 404）。 */
@@ -923,7 +1177,7 @@ class AppleApi(private val prefs: TokenStore) {
             a.id = artistResource.optString("id", artistReference.optString("id", ""))
             val attrs = artistResource.optJSONObject("attributes") ?: JSONObject()
             a.name = ChineseText.toSimplified(attrs.optString("name", ""))
-            a.artworkUrl = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: "")
+            a.artworkUrl = extractArtistArtwork(attrs)
             a.bornOrFormed = attrs.optString("bornOrFormed", "")
             a.isGroup = attrs.optBoolean("isGroup", false)
             a.genreNames = attrs.optJSONArray("genreNames")?.let { genres ->
@@ -1683,8 +1937,12 @@ class AppleApi(private val prefs: TokenStore) {
     fun downloadBytes(url: String): ByteArray = downloadRange(url, -1, -1)
 
     /** 带 Range 的下载（不向媒体 CDN 泄漏账号令牌）。 */
-    fun downloadRange(url: String, start: Int, end: Int): ByteArray =
-        Http.getBytes(url, mediaHeaders(), start, end, 60000)
+    fun downloadRange(
+        url: String,
+        start: Int,
+        end: Int,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): ByteArray = Http.getBytes(url, mediaHeaders(), start, end, 60000, onBytesRead)
 
     /** 下载文本（m3u8）。 */
     fun downloadText(url: String): String = String(downloadBytes(url), Charsets.UTF_8)
@@ -1858,10 +2116,32 @@ class AppleApi(private val prefs: TokenStore) {
             val a = AppleArtist()
             a.id = it.optString("id", "")
             a.name = ChineseText.toSimplified(attrs.optString("name", ""))
-            a.artworkUrl = bigArtwork(attrs.optJSONObject("artwork")?.optString("url", "") ?: "")
+            a.artworkUrl = extractArtistArtwork(attrs)
+            a.genreNames = attrs.optJSONArray("genreNames")?.let { genres ->
+                (0 until genres.length())
+                    .map { index -> genres.optString(index, "").trim() }
+                    .filter(String::isNotBlank)
+            }.orEmpty()
             out.add(a)
         }
         return out
+    }
+
+    private fun extractArtistArtwork(attrs: JSONObject): String {
+        val primary = attrs.optJSONObject("artwork")?.optString("url", "").orEmpty()
+        if (primary.isNotBlank()) return bigArtwork(primary)
+        val editorial = attrs.optJSONObject("editorialArtwork") ?: return ""
+        for (slot in listOf(
+            "storeFlowcase",
+            "centeredFullscreenBackground",
+            "subscriptionHero",
+            "bannerUber",
+            "vip"
+        )) {
+            val url = editorial.optJSONObject(slot)?.optString("url", "").orEmpty()
+            if (url.isNotBlank()) return bigArtwork(url)
+        }
+        return ""
     }
 
     /** Apple 的封面 URL 模板替换成 600x600。 */
