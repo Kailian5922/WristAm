@@ -9,11 +9,12 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.applemusic.lyricstool"
+        // 使用独立包名避免与 com.applemusic.lyricstool 等第三方应用冲突，并与 :app 保持完全一致以支持 Wearable Data Layer 互通
+        applicationId = "com.kailian.wristam"
         minSdk = 24
         targetSdk = 36
-        versionCode = 18
-        versionName = "2.0"
+        versionCode = 20001
+        versionName = "2.0.1"
     }
 
     signingConfigs {
