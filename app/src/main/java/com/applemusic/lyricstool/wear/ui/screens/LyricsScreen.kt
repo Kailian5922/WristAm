@@ -12,10 +12,8 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.ScrollableDefaults
 import androidx.compose.foundation.gestures.animateScrollBy
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -51,13 +49,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
@@ -66,7 +63,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
@@ -82,6 +79,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.wear.compose.foundation.rememberActiveFocusRequester
+import androidx.wear.compose.foundation.rotary.RotaryScrollableDefaults
+import androidx.wear.compose.foundation.rotary.rotaryScrollable
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
@@ -92,6 +92,7 @@ import com.applemusic.lyricstool.wear.ui.theme.PlusJakartaSansFontFamily
 import com.applemusic.lyricstool.wear.viewmodel.LyricsViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.text.BreakIterator
 import kotlin.math.abs
@@ -845,8 +846,8 @@ private fun WearLyricsPage(
  * 完整级现代 Wear OS 逐字歌词界面：
  * - 响应式播放状态与 seek 修订监听；
  * - 绘制期 30fps 平滑逐字扫光，列表零重组；
- * - 真正可用的表冠滚动（focusable + FocusRequester 随可见性自动获焦）；
- * - 拖动结束后才计时 3.5 秒自动回正；
+ * - 原生 Wear OS 表冠 / 三星模拟与物理表圈滚动（rotaryScrollable + 惯性滑动 + 三星触觉反馈 + 分层焦点协同）；
+ * - 拖动或表冠惯性滚动完全停止后再计时 3.5 秒自动回正；
  * - 保持用户偏好的紧凑行距、强调色高亮与动态专辑模糊背景。
  */
 @Composable
@@ -893,14 +894,8 @@ fun LyricsScreen(
     var autoResumeJob by remember { mutableStateOf<Job?>(null) }
     val coroutineScope = rememberCoroutineScope()
 
-    val focusRequester = remember { FocusRequester() }
     LaunchedEffect(isVisible) {
-        if (isVisible) {
-            try {
-                focusRequester.requestFocus()
-            } catch (_: Exception) {
-            }
-        } else {
+        if (!isVisible) {
             autoResumeJob?.cancel()
             isUserBrowsingLyrics = false
         }
@@ -915,9 +910,16 @@ fun LyricsScreen(
     fun scheduleAutoResume() {
         autoResumeJob?.cancel()
         autoResumeJob = coroutineScope.launch {
-            delay(3500L)
-            if (!isDraggingList) {
-                isUserBrowsingLyrics = false
+            while (true) {
+                // 等待触摸拖动及表冠/表圈惯性滚动完全静止后再开始 3.5 秒回正倒计时
+                delay(120L)
+                snapshotFlow { isDraggingList || pageState.listState.isScrollInProgress }
+                    .first { !it }
+                delay(3500L)
+                if (!isDraggingList && !pageState.listState.isScrollInProgress) {
+                    isUserBrowsingLyrics = false
+                    break
+                }
             }
         }
     }
@@ -942,19 +944,26 @@ fun LyricsScreen(
         isUserBrowsingLyrics = false
     }
 
+    val rotaryBehavior = RotaryScrollableDefaults.behavior(
+        scrollableState = pageState.listState,
+        flingBehavior = ScrollableDefaults.flingBehavior()
+    )
+
     ScreenScaffold(scrollState = pageState.listState) { _ ->
+        val focusRequester = rememberActiveFocusRequester()
         Box(
             modifier = modifier
                 .fillMaxSize()
-                .focusRequester(focusRequester)
-                .focusable()
-                .onRotaryScrollEvent { event ->
-                    handleRotaryScroll()
-                    coroutineScope.launch {
-                        pageState.listState.scrollBy(event.verticalScrollPixels)
+                .onPreRotaryScrollEvent {
+                    if (lines.isNotEmpty()) {
+                        handleRotaryScroll()
                     }
-                    true
+                    false
                 }
+                .rotaryScrollable(
+                    behavior = rotaryBehavior,
+                    focusRequester = focusRequester
+                )
         ) {
             when {
                 state.isLoading -> {
