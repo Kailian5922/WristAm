@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Kailian5922/WristAm/releases/latest">
-    <img src="https://img.shields.io/badge/Release-v2.0.5-ff2d55?logo=github" alt="Release v2.0.5" />
+    <img src="https://img.shields.io/badge/Release-v2.0.6-ff2d55?logo=github" alt="Release v2.0.6" />
   </a>
   <img src="https://img.shields.io/badge/Platform-Wear%20OS%20%7C%20Android-blue?logo=android" alt="Platform" />
   <img src="https://img.shields.io/badge/Kotlin-2.0-purple?logo=kotlin" alt="Kotlin" />
@@ -111,6 +111,9 @@ WristAm/
 
 ## 📦 版本更新记录 (Changelog)
 
+- **v2.0.6**
+  - 优化长按呼出睡眠定时页面（`SleepTimerScreen`）的入场动画流畅度，移除首帧同步文本测量、冗余整页透明度重组与逐项离屏 GPU 图层；
+  - 重构双滚轮焦点管理与震动引擎，改由真实刻度（`centerItemIndex`）一对一触发稳定触觉反馈，修复表冠滑动震动频率错乱、时有时无、划着划着消失及手指滑动无震动的问题。
 - **v2.0.5**
   - 修复定时倒计时胶囊与播放按钮重合的问题，适配 `192dp` / `227dp` 双尺寸表盘；
   - 修复从播放页点击歌手仅显示资料库曲目的问题，现与搜索页一致完整展示热门歌曲、精选专辑、单曲与 EP、歌手简介及相似艺人；
