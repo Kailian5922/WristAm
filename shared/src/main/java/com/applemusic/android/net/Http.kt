@@ -42,7 +42,8 @@ object Http {
         readTimeoutMs: Int = 30000,
         rangeStart: Int = -1,
         rangeEnd: Int = -1,
-        retryNonIdempotent: Boolean = false
+        retryNonIdempotent: Boolean = false,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
     ): Response {
         val upperMethod = method.uppercase()
         val canRetry = retryNonIdempotent ||
@@ -83,13 +84,15 @@ object Http {
                 }
 
                 val code = conn.responseCode
+                val contentLen = conn.contentLengthLong.takeIf { it > 0L } ?: -1L
                 val stream: InputStream? = try {
                     conn.inputStream
                 } catch (_: Exception) {
                     conn.errorStream
                 }
                 // 使用 .use 归还底层连接到 Keep-Alive 连接池，绝不盲目 disconnect()
-                val bytes = stream?.use { it.readBytesSafe() } ?: ByteArray(0)
+                val progressCb = if (code in 200..299) onBytesRead else null
+                val bytes = stream?.use { it.readBytesSafe(contentLen, progressCb) } ?: ByteArray(0)
 
                 val hs = HashMap<String, List<String>>()
                 for ((k, v) in conn.headerFields) {
@@ -159,9 +162,20 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         rangeStart: Int = -1,
         rangeEnd: Int = -1,
-        readTimeoutMs: Int = 60000
+        readTimeoutMs: Int = 60000,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
     ): Response {
-        val r = request(url, "GET", headers, null, 15000, readTimeoutMs, rangeStart, rangeEnd)
+        val r = request(
+            url = url,
+            method = "GET",
+            headers = headers,
+            body = null,
+            connectTimeoutMs = 15000,
+            readTimeoutMs = readTimeoutMs,
+            rangeStart = rangeStart,
+            rangeEnd = rangeEnd,
+            onBytesRead = onBytesRead
+        )
         if (r.code != 200 && r.code != 206) {
             throw RuntimeException("HTTP ${r.code} @ $url")
         }
@@ -174,8 +188,9 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         rangeStart: Int = -1,
         rangeEnd: Int = -1,
-        readTimeoutMs: Int = 60000
-    ): ByteArray = getRange(url, headers, rangeStart, rangeEnd, readTimeoutMs).body
+        readTimeoutMs: Int = 60000,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): ByteArray = getRange(url, headers, rangeStart, rangeEnd, readTimeoutMs, onBytesRead).body
 
     /** POST JSON，期望 2xx。 */
     fun postJson(
@@ -201,13 +216,37 @@ object Http {
         readTimeoutMs: Int = 20000
     ): Response = request(url, "POST", headers, jsonBody.toByteArray(Charsets.UTF_8), 15000, readTimeoutMs)
 
-    private fun InputStream.readBytesSafe(): ByteArray {
+    private fun InputStream.readBytesSafe(
+        totalBytes: Long = -1L,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): ByteArray {
         val out = ByteArrayOutputStream(64 * 1024)
         val buf = ByteArray(32 * 1024)
+        var downloaded = 0L
+        var lastReported = 0L
         while (true) {
+            if (Thread.currentThread().isInterrupted) {
+                throw InterruptedException("HTTP stream read cancelled")
+            }
             val n = read(buf)
             if (n < 0) break
-            if (n > 0) out.write(buf, 0, n)
+            if (n > 0) {
+                out.write(buf, 0, n)
+                downloaded += n
+                if (onBytesRead != null && downloaded - lastReported >= 32 * 1024L) {
+                    lastReported = downloaded
+                    try {
+                        onBytesRead(downloaded, totalBytes)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+        if (onBytesRead != null && downloaded > lastReported) {
+            try {
+                onBytesRead(downloaded, totalBytes)
+            } catch (_: Throwable) {
+            }
         }
         return out.toByteArray()
     }

@@ -321,10 +321,8 @@ class SearchViewModel(
         playbackRepository.playSongs(listOf(song), 0)
     }
 
-    fun downloadSong(song: SongHit, onToast: (String, Boolean) -> Unit) {
-        downloadRepository.startDownload(song) { msg ->
-            onToast(msg, msg.contains("失败") || msg.contains("无效"))
-        }
+    fun downloadSong(song: SongHit) {
+        downloadRepository.startDownload(song)
     }
 
     private companion object {

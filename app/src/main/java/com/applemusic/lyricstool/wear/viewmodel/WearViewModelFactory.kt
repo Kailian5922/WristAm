@@ -21,7 +21,8 @@ class WearViewModelFactory(
         PlayerViewModel::class.java -> PlayerViewModel(
             playbackRepository = container.playbackRepository,
             favoritesRepository = container.favoritesRepository,
-            sleepTimerRepository = container.sleepTimerRepository
+            sleepTimerRepository = container.sleepTimerRepository,
+            downloadRepository = container.downloadRepository
         ) as T
         LyricsViewModel::class.java -> LyricsViewModel(
             playbackRepository = container.playbackRepository,
@@ -57,7 +58,8 @@ class PlaylistDetailViewModelFactory(
             return PlaylistDetailViewModel(
                 playlistId = playlistId,
                 libraryRepository = container.libraryRepository,
-                playbackRepository = container.playbackRepository
+                playbackRepository = container.playbackRepository,
+                downloadRepository = container.downloadRepository
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
@@ -76,6 +78,7 @@ class ArtistViewModelFactory(
                 rawArtistParam = rawArtistParam,
                 artistRepository = container.artistRepository,
                 playbackRepository = container.playbackRepository,
+                downloadRepository = container.downloadRepository,
                 directArtistId = directArtistId
             ) as T
         }

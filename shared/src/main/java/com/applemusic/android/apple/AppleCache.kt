@@ -200,6 +200,15 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
 
         @Volatile
         var pinRequested: Boolean = false
+
+        @Volatile
+        var lastStage: AppleDownloader.Stage = AppleDownloader.Stage.RESOLVING
+
+        @Volatile
+        var lastPercent: Int = 0
+
+        @Volatile
+        var lastNote: String = ""
     }
 
     /** 临时流式缓存目录（受容量淘汰与清理约束）。 */
@@ -674,8 +683,10 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
             rememberMetadata(songId, metadata)
             if (pinOnComplete && !isPinned(songId)) {
                 setPinned(songId, true)
+                onProgress?.invoke(AppleDownloader.Stage.DONE, 100, "完成")
                 return getCachedPath(songId, touchAccess = false) ?: existingPath
             }
+            onProgress?.invoke(AppleDownloader.Stage.DONE, 100, "完成")
             return existingPath
         }
 
@@ -699,6 +710,12 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
 
         if (!mine) {
             Logx.i(TAG, "ensure: 复用进行中的任务 $songId")
+            if (onProgress != null && task.lastPercent > 0) {
+                try {
+                    onProgress(task.lastStage, task.lastPercent, task.lastNote)
+                } catch (_: Throwable) {
+                }
+            }
             try {
                 task.latch.await()
             } catch (ie: InterruptedException) {
@@ -724,6 +741,9 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         try {
             Logx.i(TAG, "ensure: 发起下载 $songId isLibrary=$isLibrary pin=$pinOnComplete")
             val broadcastProgress: (AppleDownloader.Stage, Int, String) -> Unit = { st, pct, note ->
+                task.lastStage = st
+                task.lastPercent = pct
+                task.lastNote = note
                 for (listener in task.progressListeners) {
                     try {
                         listener(st, pct, note)
@@ -755,22 +775,32 @@ class AppleCache(private val context: Context, private val api: AppleApi) {
         val fileName = fileNameFor(songId)
         val initialPin = task.pinRequested
         val targetFile = File(if (initialPin) downloadsDir else tempDir, fileName)
-        var res = AppleDownloader.downloadSong(api, songId, isLibrary, targetFile.absolutePath, onProgress)
+        val nonFailedProgress: ((AppleDownloader.Stage, Int, String) -> Unit)? = onProgress?.let { cb ->
+            { st, pct, note ->
+                if (st != AppleDownloader.Stage.FAILED) {
+                    cb(st, pct, note)
+                }
+            }
+        }
+        var res = AppleDownloader.downloadSong(api, songId, isLibrary, targetFile.absolutePath, nonFailedProgress)
         if (!res.ok && !Thread.currentThread().isInterrupted) {
             val altId = if (isLibrary) api.librarySongCatalogId(songId) else ""
             if (altId.isNotEmpty() && altId != songId) {
                 Logx.w(TAG, "ensure: universalLibraryId 失败（${res.message}），改用 catalogId=$altId 重试 $songId")
-                res = AppleDownloader.downloadSong(api, altId, false, targetFile.absolutePath, onProgress)
+                res = AppleDownloader.downloadSong(api, altId, false, targetFile.absolutePath, nonFailedProgress)
             } else if (!isLibrary) {
                 val libId = MusicRepository.findSong(songId)?.takeIf { it.isLibrary }?.appleId
                     ?.takeIf { it.startsWith("i.") }
                 if (!libId.isNullOrEmpty()) {
                     Logx.w(TAG, "ensure: salableAdamId 失败（${res.message}），改用资料库标识重试 $libId")
-                    res = AppleDownloader.downloadSong(api, libId, true, targetFile.absolutePath, onProgress)
+                    res = AppleDownloader.downloadSong(api, libId, true, targetFile.absolutePath, nonFailedProgress)
                 }
             }
         }
-        if (!res.ok) throw RuntimeException(res.message.ifEmpty { "下载失败" })
+        if (!res.ok) {
+            onProgress?.invoke(AppleDownloader.Stage.FAILED, 0, res.message.ifEmpty { "下载失败" })
+            throw RuntimeException(res.message.ifEmpty { "下载失败" })
+        }
 
         val finalPinned = task.pinRequested
         var finalFile = targetFile

@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.applemusic.lyricstool.wear.data.AuthRepository
 import com.applemusic.lyricstool.wear.data.AuthState
+import com.applemusic.lyricstool.wear.data.DownloadEvent
 import com.applemusic.lyricstool.wear.data.DownloadRepository
 import com.applemusic.lyricstool.wear.data.FavoritesRepository
 import com.applemusic.lyricstool.wear.data.LibraryRepository
@@ -19,9 +20,16 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+enum class ToastKind {
+    Info,
+    Success,
+    Error
+}
+
 data class ToastMessage(
     val text: String,
     val isError: Boolean = false,
+    val kind: ToastKind = if (isError) ToastKind.Error else ToastKind.Info,
     val id: Long = System.nanoTime()
 )
 
@@ -41,7 +49,7 @@ class AppViewModel(
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    private val _toastEvents = MutableSharedFlow<ToastMessage>(extraBufferCapacity = 8)
+    private val _toastEvents = MutableSharedFlow<ToastMessage>(extraBufferCapacity = 16)
     val toastEvents: SharedFlow<ToastMessage> = _toastEvents.asSharedFlow()
 
     init {
@@ -62,11 +70,41 @@ class AppViewModel(
                 showToast("定时播放已结束，已暂停播放")
             }
         }
+        viewModelScope.launch {
+            downloadRepository.events.collect { event ->
+                when (event) {
+                    is DownloadEvent.Started ->
+                        showStatusToast("开始下载《${event.songTitle}》", ToastKind.Info)
+                    is DownloadEvent.AlreadyDownloading ->
+                        showStatusToast("《${event.songTitle}》正在下载 (${event.percent}%)", ToastKind.Info)
+                    is DownloadEvent.AlreadyDownloaded ->
+                        showStatusToast("《${event.songTitle}》已下载", ToastKind.Success)
+                    DownloadEvent.InvalidSong ->
+                        showStatusToast("歌曲 ID 无效，无法下载", ToastKind.Error)
+                    is DownloadEvent.Succeeded ->
+                        showStatusToast("下载完成：《${event.songTitle}》", ToastKind.Success)
+                    is DownloadEvent.Failed ->
+                        showStatusToast("下载失败：《${event.songTitle}》${event.reason}", ToastKind.Error)
+                    is DownloadEvent.Cancelled ->
+                        showStatusToast("已取消下载《${event.songTitle}》", ToastKind.Info)
+                }
+            }
+        }
     }
 
     fun showToast(message: String, isError: Boolean = false) {
+        showStatusToast(message, if (isError) ToastKind.Error else ToastKind.Info)
+    }
+
+    fun showStatusToast(message: String, kind: ToastKind) {
         if (message.isBlank()) return
-        _toastEvents.tryEmit(ToastMessage(text = message, isError = isError))
+        _toastEvents.tryEmit(
+            ToastMessage(
+                text = message,
+                isError = kind == ToastKind.Error,
+                kind = kind
+            )
+        )
     }
 
     fun clearTemporaryCache() {
@@ -74,10 +112,10 @@ class AppViewModel(
             val result = downloadRepository.clearTemporaryCache()
             result.fold(
                 onSuccess = { removed ->
-                    showToast("已清理 $removed 首临时缓存，保留全部已下载歌曲")
+                    showStatusToast("已清理 $removed 首临时缓存，保留全部已下载歌曲", ToastKind.Success)
                 },
                 onFailure = { err ->
-                    showToast("清理缓存失败：${err.message ?: "未知错误"}", isError = true)
+                    showStatusToast("清理缓存失败：${err.message ?: "未知错误"}", ToastKind.Error)
                 }
             )
         }

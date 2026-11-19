@@ -116,16 +116,16 @@ object AppleDownloader {
 
             checkNotInterrupted()
             // ④ 下载整段音频
-            report(Stage.DOWNLOADING, 20, "下载音频数据")
+            report(Stage.DOWNLOADING, 18, "下载音频数据")
             val mediaUrl = HlsParser.absolute(media.baseUrl, media.mediaUri)
             val totalLen = totalLength(media)
             val data = downloadMedia(api, mediaUrl, media, totalLen) { p ->
-                report(Stage.DOWNLOADING, 20 + (p * 45f).toInt(), "下载音频数据")
+                report(Stage.DOWNLOADING, 18 + (p * 60f).toInt(), "下载音频数据")
             }
 
             checkNotInterrupted()
             // ⑤ 解密
-            report(Stage.DECRYPTING, 65, "解密音频数据")
+            report(Stage.DECRYPTING, 82, "解密音频数据")
             val probeBefore = probeFirstSample(data)
             val stats = CencDecryptor.decryptWholeFile(key, data)
             val probeAfter = probeFirstSample(data)
@@ -138,15 +138,15 @@ object AppleDownloader {
 
             checkNotInterrupted()
             // ⑥ 写文件：清 DRM 残留 → 重封装成普通 MP4 → ftyp 归一化 → 原子落盘
-            report(Stage.WRITING, 85, "优化音频格式")
+            report(Stage.WRITING, 88, "优化音频格式")
             val cleaned = Mp4Cleaner.stripDrmHeaders(data)
-            report(Stage.WRITING, 92, "封装音频流")
+            report(Stage.WRITING, 93, "封装音频流")
             val remuxed = Mp4Remuxer.remux(cleaned)
             val final = remuxed ?: cleaned
             if (remuxed == null) {
                 Logx.w(TAG, "重封装未生效，保留清理后的 fMP4")
             }
-            report(Stage.WRITING, 96, "写入本地缓存")
+            report(Stage.WRITING, 97, "写入本地缓存")
             Mp4Cleaner.normalizeFtyp(final)
             writeFileAtomic(outPath, final)
             report(Stage.WRITING, 100, "准备就绪")
@@ -322,8 +322,20 @@ object AppleDownloader {
         val distinctUris = segs.any { it.uri.isNotEmpty() && it.uri != media.mediaUri }
         if (parallelChunks <= 1 || segs.size <= 1 || distinctUris || !rangesCover(media.initRange, segs, totalLen)) {
             Logx.i(TAG, "downloadMedia: 回退整段单请求")
-            onProgress(0.05f)
-            val whole = api.downloadRange(url, -1, -1)
+            onProgress(0.03f)
+            val whole = api.downloadRange(url, -1, -1) { read, total ->
+                val denom = when {
+                    total > 0L -> total.toFloat()
+                    totalLen > 0 -> totalLen.toFloat()
+                    else -> 0f
+                }
+                val frac = if (denom > 0f) {
+                    (read.toFloat() / denom).coerceIn(0.03f, 0.99f)
+                } else {
+                    (0.05 + 0.88 * (1.0 - kotlin.math.exp(-read.toDouble() / (4.0 * 1024 * 1024)))).toFloat()
+                }
+                onProgress(frac)
+            }
             if (whole.isEmpty()) throw IOException("整段音频下载为空")
             onProgress(1f)
             return whole
@@ -343,7 +355,15 @@ object AppleDownloader {
                 headers = api.mediaHeaders(),
                 rangeStart = media.initRange.offset,
                 rangeEnd = media.initRange.offset + initLen - 1,
-                readTimeoutMs = 60000
+                readTimeoutMs = 60000,
+                onBytesRead = { read, total ->
+                    if (total > initLen * 2L || read > initLen * 2L) {
+                        val denom = if (total > 0L) total.toFloat() else totalLen.toFloat()
+                        if (denom > 0f) {
+                            onProgress((read.toFloat() / denom).coerceIn(0.02f, 0.99f))
+                        }
+                    }
+                }
             )
             if (initResp.code == 200 && initResp.body.size == totalLen) {
                 // CDN 直接返回整首歌，无需再并发拉取分片

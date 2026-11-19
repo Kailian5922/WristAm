@@ -20,15 +20,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.TransformingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberTransformingLazyColumnState
+import androidx.wear.compose.material3.CircularProgressIndicator
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.OutlinedButton
+import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import androidx.wear.compose.material3.TextButton
@@ -178,20 +181,40 @@ fun BrowseMenuScreen(
                             .padding(horizontal = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            HorologistIcons.Download,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        if (state.activeDownloadCount > 0) {
+                            CircularProgressIndicator(
+                                progress = {
+                                    ((state.activeDownloadPercent ?: 0) / 100f).coerceIn(0.05f, 1f)
+                                },
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.5.dp,
+                                colors = ProgressIndicatorDefaults.colors(
+                                    indicatorColor = MaterialTheme.colorScheme.primary
+                                )
+                            )
+                        } else {
+                            Icon(
+                                HorologistIcons.Download,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                         Spacer(modifier = Modifier.width(8.dp))
                         val label = when {
                             state.activeDownloadCount > 0 ->
-                                "已下载 (${state.downloadedCount} · 下载中 ${state.activeDownloadCount})"
+                                "下载中 ${state.activeDownloadCount}首 · ${state.activeDownloadPercent ?: 0}%"
+                            state.failedDownloadCount > 0 ->
+                                "已下载 (${state.downloadedCount} · 失败${state.failedDownloadCount})"
                             state.downloadedCount > 0 ->
                                 "已下载歌曲 (${state.downloadedCount})"
                             else -> "已下载歌曲"
                         }
-                        Text(label, style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
             }

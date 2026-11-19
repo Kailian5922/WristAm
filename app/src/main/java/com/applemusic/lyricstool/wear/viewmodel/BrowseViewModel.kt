@@ -3,6 +3,8 @@ package com.applemusic.lyricstool.wear.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.applemusic.android.apple.AppleLibrarySync
+import com.applemusic.lyricstool.data.SongHit
+import com.applemusic.lyricstool.wear.data.ActiveDownload
 import com.applemusic.lyricstool.wear.data.DownloadRepository
 import com.applemusic.lyricstool.wear.data.LibraryRepository
 import kotlinx.coroutines.flow.SharingStarted
@@ -17,7 +19,11 @@ data class BrowseUiState(
     val syncing: Boolean = false,
     val syncNote: String = "",
     val downloadedCount: Int = 0,
-    val activeDownloadCount: Int = 0
+    val activeDownloadCount: Int = 0,
+    val activeDownloadPercent: Int? = null,
+    val failedDownloadCount: Int = 0,
+    val downloadedIds: Set<String> = emptySet(),
+    val activeDownloads: Map<String, ActiveDownload> = emptyMap()
 )
 
 class BrowseViewModel(
@@ -29,15 +35,29 @@ class BrowseViewModel(
         libraryRepository.state,
         downloadRepository.state
     ) { lib, dl ->
+        val activeList = dl.activeDownloads.values
+        val avgPercent = if (activeList.isNotEmpty()) {
+            activeList.sumOf { it.percent.coerceIn(0, 100) } / activeList.size
+        } else {
+            null
+        }
         BrowseUiState(
             librarySongs = lib.songs,
             playlists = lib.playlists,
             syncing = lib.syncing,
             syncNote = lib.syncNote,
             downloadedCount = dl.entries.size,
-            activeDownloadCount = dl.activeDownloads.size
+            activeDownloadCount = dl.activeDownloads.size,
+            activeDownloadPercent = avgPercent,
+            failedDownloadCount = dl.failedDownloads.size,
+            downloadedIds = dl.downloadedIds,
+            activeDownloads = dl.activeDownloads
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), BrowseUiState())
+
+    fun downloadSong(song: SongHit) {
+        downloadRepository.startDownload(song)
+    }
 
     fun syncLibrary(onToast: (String, Boolean) -> Unit) {
         if (uiState.value.syncing) return

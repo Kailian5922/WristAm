@@ -40,6 +40,7 @@ import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -78,7 +79,7 @@ private fun Configuration.getScreenSizeInDpFromPercentage(percent: Float): Dp =
  * 严格保持 Google Horologist 播放器视觉布局：
  * - TopSection：跑马灯歌名 + 可点击进入歌手主页的强调色艺人名；
  * - MiddleSection：上一首 + 10-scallop 波浪形变进度播放/暂停按钮（长按进入定时播放）+ 下一首；
- * - BottomSection：缓冲状态 或 播放队列 & 收藏快捷按钮；
+ * - BottomSection：缓冲状态 或 播放队列、离线下载进度与收藏快捷按钮；
  * - 表冠旋转调节媒体音量 + 零多余重组的绘制期进度更新。
  */
 @Composable
@@ -313,7 +314,7 @@ fun PlayerScreen(
                     }
                 }
 
-                // Bottom Section (Preparing note / Queue & Favorite)
+                // Bottom Section (Preparing note / Queue, Download & Favorite)
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -338,13 +339,14 @@ fun PlayerScreen(
                             modifier = Modifier.padding(horizontal = 16.dp)
                         )
                     } else {
+                        val activeDownload = state.activeDownload
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             FilledTonalIconButton(
                                 onClick = onOpenQueue,
-                                modifier = Modifier.size(44.dp),
+                                modifier = Modifier.size(40.dp),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                     contentColor = MaterialTheme.colorScheme.onSurface
@@ -353,13 +355,65 @@ fun PlayerScreen(
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_baseline_queue_music_24),
                                     contentDescription = "播放列表",
-                                    modifier = Modifier.size(22.dp)
+                                    modifier = Modifier.size(20.dp)
                                 )
+                            }
+                            FilledTonalIconButton(
+                                onClick = viewModel::downloadCurrentSong,
+                                enabled = state.currentSong != null,
+                                modifier = Modifier.size(40.dp),
+                                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                    containerColor = if (state.isDownloaded && activeDownload == null) {
+                                        MaterialTheme.colorScheme.primaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainer
+                                    },
+                                    contentColor = if (state.isDownloaded && activeDownload == null) {
+                                        MaterialTheme.colorScheme.onPrimaryContainer
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    }
+                                )
+                            ) {
+                                if (activeDownload != null) {
+                                    val percent = activeDownload.percent.coerceIn(0, 100)
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(
+                                            progress = { (percent / 100f).coerceIn(0.05f, 1f) },
+                                            modifier = Modifier.size(34.dp),
+                                            strokeWidth = 2.5.dp,
+                                            colors = ProgressIndicatorDefaults.colors(
+                                                indicatorColor = MaterialTheme.colorScheme.primary
+                                            )
+                                        )
+                                        Text(
+                                            text = if (percent >= 100) "100" else "$percent%",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold
+                                            ),
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                } else {
+                                    Icon(
+                                        imageVector = if (state.isDownloaded) {
+                                            HorologistIcons.DownloadDone
+                                        } else {
+                                            HorologistIcons.Download
+                                        },
+                                        contentDescription = if (state.isDownloaded) "已下载" else "下载当前歌曲",
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
                             }
                             FilledTonalIconButton(
                                 onClick = { viewModel.toggleFavorite(onToast) },
                                 enabled = !state.favoritePending && state.currentSong != null,
-                                modifier = Modifier.size(44.dp),
+                                modifier = Modifier.size(40.dp),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = if (state.isFavorited) {
                                         MaterialTheme.colorScheme.primaryContainer
@@ -394,7 +448,7 @@ fun PlayerScreen(
                                         } else {
                                             MaterialTheme.colorScheme.onSurface
                                         },
-                                        modifier = Modifier.size(22.dp)
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }

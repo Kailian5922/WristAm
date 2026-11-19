@@ -32,27 +32,25 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.TransformingLazyColumn
 import androidx.wear.compose.foundation.lazy.itemsIndexed
 import androidx.wear.compose.foundation.lazy.rememberTransformingLazyColumnState
 import androidx.wear.compose.material3.Card
-import androidx.wear.compose.material3.CircularProgressIndicator
 import androidx.wear.compose.material3.FilledIconButton
 import androidx.wear.compose.material3.FilledTonalButton
-import androidx.wear.compose.material3.FilledTonalIconButton
 import androidx.wear.compose.material3.Icon
-import androidx.wear.compose.material3.IconButtonDefaults
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.OutlinedButton
-import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import coil.compose.AsyncImage
-import com.applemusic.lyricstool.wear.ui.components.HorologistIcons
+import com.applemusic.lyricstool.wear.data.containsSong
+import com.applemusic.lyricstool.wear.data.findFor
+import com.applemusic.lyricstool.wear.ui.components.SongDownloadActionButton
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
+import com.applemusic.lyricstool.wear.ui.components.WearDownloadLinearProgressBar
 import com.applemusic.lyricstool.wear.viewmodel.SearchViewModel
 
 @Composable
@@ -60,8 +58,7 @@ fun SearchScreen(
     viewModel: SearchViewModel,
     onBack: () -> Unit,
     onPlayed: () -> Unit,
-    onOpenArtist: (artistName: String, artistId: String) -> Unit,
-    onToast: (String, Boolean) -> Unit
+    onOpenArtist: (artistName: String, artistId: String) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val listState = rememberTransformingLazyColumnState()
@@ -226,9 +223,8 @@ fun SearchScreen(
                 items = state.results,
                 key = { index, song -> "${song.id}_$index" }
             ) { _, song ->
-                val cleanId = song.id.removePrefix("apple:").trim()
-                val isDownloaded = cleanId in state.downloadedIds || song.id in state.downloadedIds
-                val activeDownload = state.activeDownloads[cleanId]
+                val isDownloaded = state.downloadedIds.containsSong(song)
+                val activeDownload = state.activeDownloads.findFor(song)
 
                 Card(
                     onClick = {
@@ -239,86 +235,64 @@ fun SearchScreen(
                         .fillMaxWidth()
                         .padding(vertical = 2.dp)
                 ) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = song.title,
-                                style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = song.artist,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        if (activeDownload != null) {
-                            val percent = activeDownload.percent
-                            Box(
-                                modifier = Modifier.size(32.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                CircularProgressIndicator(
-                                    progress = { (percent / 100f).coerceIn(0.05f, 1f) },
-                                    modifier = Modifier.fillMaxSize(),
-                                    strokeWidth = 2.dp,
-                                    colors = ProgressIndicatorDefaults.colors(
-                                        indicatorColor = MaterialTheme.colorScheme.primary
-                                    )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = song.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = "$percent%",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 8.sp,
-                                        fontWeight = FontWeight.Bold
-                                    ),
-                                    color = MaterialTheme.colorScheme.primary
+                                    text = if (activeDownload != null) {
+                                        "${activeDownload.stageLabel} · ${activeDownload.percent.coerceIn(0, 100)}%"
+                                    } else {
+                                        song.artist
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (activeDownload != null) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
-                        } else if (isDownloaded) {
-                            Icon(
-                                imageVector = HorologistIcons.DownloadDone,
-                                contentDescription = "已下载",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(22.dp)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            SongDownloadActionButton(
+                                activeDownload = activeDownload,
+                                isDownloaded = isDownloaded,
+                                onDownload = { viewModel.downloadSong(song) }
                             )
-                        } else {
-                            FilledTonalIconButton(
-                                onClick = { viewModel.downloadSong(song, onToast) },
-                                modifier = Modifier.size(32.dp),
-                                colors = IconButtonDefaults.filledTonalIconButtonColors(
-                                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                                    contentColor = MaterialTheme.colorScheme.onSurface
-                                )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            FilledIconButton(
+                                onClick = {
+                                    viewModel.playSong(song)
+                                    onPlayed()
+                                },
+                                modifier = Modifier.size(32.dp)
                             ) {
                                 Icon(
-                                    imageVector = HorologistIcons.Download,
-                                    contentDescription = "下载",
-                                    modifier = Modifier.size(16.dp)
+                                    Icons.Default.PlayArrow,
+                                    contentDescription = "播放",
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        FilledIconButton(
-                            onClick = {
-                                viewModel.playSong(song)
-                                onPlayed()
-                            },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.PlayArrow,
-                                contentDescription = "播放",
-                                modifier = Modifier.size(18.dp)
+                        if (activeDownload != null) {
+                            WearDownloadLinearProgressBar(
+                                percent = activeDownload.percent,
+                                barHeight = 3.dp
                             )
                         }
                     }

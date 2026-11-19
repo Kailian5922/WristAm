@@ -1937,8 +1937,12 @@ class AppleApi(private val prefs: TokenStore) {
     fun downloadBytes(url: String): ByteArray = downloadRange(url, -1, -1)
 
     /** 带 Range 的下载（不向媒体 CDN 泄漏账号令牌）。 */
-    fun downloadRange(url: String, start: Int, end: Int): ByteArray =
-        Http.getBytes(url, mediaHeaders(), start, end, 60000)
+    fun downloadRange(
+        url: String,
+        start: Int,
+        end: Int,
+        onBytesRead: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ): ByteArray = Http.getBytes(url, mediaHeaders(), start, end, 60000, onBytesRead)
 
     /** 下载文本（m3u8）。 */
     fun downloadText(url: String): String = String(downloadBytes(url), Charsets.UTF_8)

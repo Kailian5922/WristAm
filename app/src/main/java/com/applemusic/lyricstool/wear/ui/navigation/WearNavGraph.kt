@@ -255,8 +255,7 @@ fun WearAppRoot(
                                 onPlayed = returnToPlayer,
                                 onOpenArtist = { artistName, artistId ->
                                     navController.navigate(WearRoutes.artistDetail(artistName, artistId))
-                                },
-                                onToast = appViewModel::showToast
+                                }
                             )
                         }
                     }
