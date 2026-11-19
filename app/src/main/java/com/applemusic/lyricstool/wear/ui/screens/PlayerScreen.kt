@@ -27,7 +27,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
@@ -44,6 +43,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.wear.compose.foundation.rememberActiveFocusRequester
 import androidx.wear.compose.material3.CircularProgressIndicator
 import androidx.wear.compose.material3.FilledIconButton
 import androidx.wear.compose.material3.FilledTonalIconButton
@@ -138,31 +138,25 @@ fun PlayerScreen(
         }
     }
 
-    // 播放器页表冠旋转调节媒体音量
+    // 播放器页表冠 / 表圈旋转调节媒体音量
     val audioManager = remember(context) {
         context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     }
-    val focusRequester = remember { FocusRequester() }
     var rotaryAccumulator by remember { mutableFloatStateOf(0f) }
 
-    LaunchedEffect(isVisible) {
-        if (isVisible) {
-            try {
-                focusRequester.requestFocus()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
     ScreenScaffold {
+        val focusRequester = rememberActiveFocusRequester()
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .focusRequester(focusRequester)
-                .focusable()
                 .onRotaryScrollEvent { event ->
                     val am = audioManager ?: return@onRotaryScrollEvent false
-                    rotaryAccumulator += event.verticalScrollPixels
+                    val delta = if (event.verticalScrollPixels != 0f) {
+                        event.verticalScrollPixels
+                    } else {
+                        event.horizontalScrollPixels
+                    }
+                    rotaryAccumulator += delta
                     val threshold = 48f
                     if (rotaryAccumulator >= threshold) {
                         rotaryAccumulator = 0f
@@ -181,6 +175,8 @@ fun PlayerScreen(
                     }
                     true
                 }
+                .focusRequester(focusRequester)
+                .focusable()
         ) {
             Column(
                 modifier = Modifier.fillMaxSize(),
