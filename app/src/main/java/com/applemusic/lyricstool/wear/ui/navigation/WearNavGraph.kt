@@ -39,6 +39,7 @@ import com.applemusic.lyricstool.wear.ui.screens.PlaylistsScreen
 import com.applemusic.lyricstool.wear.ui.screens.QueueScreen
 import com.applemusic.lyricstool.wear.ui.screens.RadioStationsScreen
 import com.applemusic.lyricstool.wear.ui.screens.SearchScreen
+import com.applemusic.lyricstool.wear.ui.screens.SleepTimerScreen
 import com.applemusic.lyricstool.wear.ui.theme.HorologistArtworkBackground
 import com.applemusic.lyricstool.wear.ui.theme.HorologistColors
 import com.applemusic.lyricstool.wear.ui.theme.rememberDynamicColorScheme
@@ -138,6 +139,7 @@ fun WearAppRoot(
                                         isVisible = isPlayerVisible,
                                         onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
                                         onOpenArtist = openArtistFlow,
+                                        onOpenSleepTimer = { navController.navigate(WearRoutes.SLEEP_TIMER) },
                                         onToast = appViewModel::showToast
                                     )
                                     1 -> LyricsScreen(
@@ -168,6 +170,14 @@ fun WearAppRoot(
                                 onClose = { navController.popBackStack() }
                             )
                         }
+                    }
+
+                    composable(WearRoutes.SLEEP_TIMER) {
+                        SleepTimerScreen(
+                            playerViewModel = playerViewModel,
+                            onClose = { navController.popBackStack() },
+                            onToast = appViewModel::showToast
+                        )
                     }
 
                     composable(WearRoutes.RADIO) {

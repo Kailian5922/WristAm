@@ -12,6 +12,7 @@ class WearViewModelFactory(
         AppViewModel::class.java -> AppViewModel(
             authRepository = container.authRepository,
             playbackRepository = container.playbackRepository,
+            sleepTimerRepository = container.sleepTimerRepository,
             favoritesRepository = container.favoritesRepository,
             downloadRepository = container.downloadRepository,
             libraryRepository = container.libraryRepository
@@ -19,7 +20,8 @@ class WearViewModelFactory(
         AuthViewModel::class.java -> AuthViewModel(container.authRepository) as T
         PlayerViewModel::class.java -> PlayerViewModel(
             playbackRepository = container.playbackRepository,
-            favoritesRepository = container.favoritesRepository
+            favoritesRepository = container.favoritesRepository,
+            sleepTimerRepository = container.sleepTimerRepository
         ) as T
         LyricsViewModel::class.java -> LyricsViewModel(
             playbackRepository = container.playbackRepository,

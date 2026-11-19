@@ -491,6 +491,8 @@ fun HorologistPlayPauseProgressButton(
     progressProvider: () -> Float,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier,
+    onLongClick: (() -> Unit)? = null,
+    onLongClickLabel: String? = null,
     containerSize: Dp = 76.dp,
     buttonSize: Dp = 58.dp,
     strokeWidth: Dp = 3.5.dp
@@ -531,6 +533,8 @@ fun HorologistPlayPauseProgressButton(
 
         FilledIconButton(
             onClick = onToggle,
+            onLongClick = onLongClick,
+            onLongClickLabel = onLongClickLabel,
             colors = IconButtonDefaults.filledIconButtonColors(
                 containerColor = MaterialTheme.colorScheme.primary,
                 contentColor = MaterialTheme.colorScheme.onPrimary

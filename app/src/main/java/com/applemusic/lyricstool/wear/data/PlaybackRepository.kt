@@ -48,6 +48,10 @@ class PlaybackRepository(
         PlaybackEngine.toggle()
     }
 
+    fun pause() {
+        PlaybackEngine.pause()
+    }
+
     fun next() {
         PlaybackEngine.next()
     }

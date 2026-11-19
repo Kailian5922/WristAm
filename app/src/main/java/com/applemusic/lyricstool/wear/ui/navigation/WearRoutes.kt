@@ -5,6 +5,7 @@ import android.net.Uri
 object WearRoutes {
     const val MAIN = "main"
     const val QUEUE = "queue"
+    const val SLEEP_TIMER = "sleep_timer"
     const val RADIO = "radio"
     const val LIBRARY_SONGS = "library_songs"
     const val PLAYLISTS = "playlists"

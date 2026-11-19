@@ -8,6 +8,7 @@ import com.applemusic.lyricstool.wear.data.DownloadRepository
 import com.applemusic.lyricstool.wear.data.FavoritesRepository
 import com.applemusic.lyricstool.wear.data.LibraryRepository
 import com.applemusic.lyricstool.wear.data.PlaybackRepository
+import com.applemusic.lyricstool.wear.data.SleepTimerRepository
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -27,6 +28,7 @@ data class ToastMessage(
 class AppViewModel(
     private val authRepository: AuthRepository,
     playbackRepository: PlaybackRepository,
+    private val sleepTimerRepository: SleepTimerRepository,
     private val favoritesRepository: FavoritesRepository,
     private val downloadRepository: DownloadRepository,
     private val libraryRepository: LibraryRepository
@@ -55,6 +57,11 @@ class AppViewModel(
                     }
                 }
         }
+        viewModelScope.launch {
+            sleepTimerRepository.expiredEvents.collect {
+                showToast("定时播放已结束，已暂停播放")
+            }
+        }
     }
 
     fun showToast(message: String, isError: Boolean = false) {
@@ -77,6 +84,7 @@ class AppViewModel(
     }
 
     fun signOut() {
+        sleepTimerRepository.cancel()
         authRepository.signOut()
         showToast("已退出当前账号")
     }
