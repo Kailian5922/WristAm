@@ -9,12 +9,12 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        // 与 :phone 伴侣端保持完全一致的 applicationId，Google Play Services Wearable Data Layer 才能正常互通
-        applicationId = "com.applemusic.lyricstool"
+        // 使用独立包名避免与 com.applemusic.lyricstool 等第三方应用冲突，并与 :phone 保持完全一致以支持 Wearable Data Layer 互通
+        applicationId = "com.kailian.wristam"
         minSdk = 30
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 20001
+        versionName = "2.0.1"
     }
 
     signingConfigs {
