@@ -154,7 +154,11 @@ fun WearAppRoot(
                                         isVisible = isPlayerVisible,
                                         onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
                                         onOpenArtist = openArtistFlow,
-                                        onOpenSleepTimer = { navController.navigate(WearRoutes.SLEEP_TIMER) },
+                                        onOpenSleepTimer = {
+                                            navController.navigate(WearRoutes.SLEEP_TIMER) {
+                                                launchSingleTop = true
+                                            }
+                                        },
                                         onToast = appViewModel::showToast
                                     )
                                     1 -> LyricsScreen(
