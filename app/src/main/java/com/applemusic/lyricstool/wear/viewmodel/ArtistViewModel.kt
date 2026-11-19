@@ -37,11 +37,16 @@ data class ArtistUiState(
 class ArtistViewModel(
     rawArtistParam: String,
     private val artistRepository: ArtistRepository,
-    private val playbackRepository: PlaybackRepository
+    private val playbackRepository: PlaybackRepository,
+    private val directArtistId: String = ""
 ) : ViewModel() {
 
-    private val parsed = ArtistNameParser.splitArtists(rawArtistParam).ifEmpty {
+    private val parsed = if (directArtistId.isNotBlank()) {
         listOf(rawArtistParam.trim())
+    } else {
+        ArtistNameParser.splitArtists(rawArtistParam).ifEmpty {
+            listOf(rawArtistParam.trim())
+        }
     }
     private var loadJob: Job? = null
     private var loadMoreJob: Job? = null
@@ -57,7 +62,7 @@ class ArtistViewModel(
     val uiState: StateFlow<ArtistUiState> = _uiState.asStateFlow()
 
     init {
-        loadArtist(parsed.first())
+        loadArtist(parsed.first(), preferredArtistId = directArtistId)
     }
 
     fun selectArtistTab(artistName: String) {
@@ -67,7 +72,7 @@ class ArtistViewModel(
         loadArtist(artistName)
     }
 
-    private fun loadArtist(artistName: String) {
+    private fun loadArtist(artistName: String, preferredArtistId: String = "") {
         loadJob?.cancel()
         loadMoreJob?.cancel()
         albumJob?.cancel()
@@ -91,7 +96,7 @@ class ArtistViewModel(
 
         loadJob = viewModelScope.launch {
             try {
-                val res = artistRepository.loadArtist(artistName)
+                val res = artistRepository.loadArtist(artistName, preferredArtistId = preferredArtistId)
                 val initialTop = res.page?.topSongs.orEmpty()
                 topSongsOffset = initialTop.size
                 _uiState.update {

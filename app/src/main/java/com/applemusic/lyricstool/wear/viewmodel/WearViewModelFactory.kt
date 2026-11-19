@@ -66,7 +66,8 @@ class PlaylistDetailViewModelFactory(
 
 class ArtistViewModelFactory(
     private val container: WearAppContainer,
-    private val rawArtistParam: String
+    private val rawArtistParam: String,
+    private val directArtistId: String = ""
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -74,7 +75,8 @@ class ArtistViewModelFactory(
             return ArtistViewModel(
                 rawArtistParam = rawArtistParam,
                 artistRepository = container.artistRepository,
-                playbackRepository = container.playbackRepository
+                playbackRepository = container.playbackRepository,
+                directArtistId = directArtistId
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")

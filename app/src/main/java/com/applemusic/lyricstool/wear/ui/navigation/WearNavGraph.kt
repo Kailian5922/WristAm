@@ -253,6 +253,9 @@ fun WearAppRoot(
                                 viewModel = searchVm,
                                 onBack = { navController.popBackStack() },
                                 onPlayed = returnToPlayer,
+                                onOpenArtist = { artistName, artistId ->
+                                    navController.navigate(WearRoutes.artistDetail(artistName, artistId))
+                                },
                                 onToast = appViewModel::showToast
                             )
                         }
@@ -294,12 +297,20 @@ fun WearAppRoot(
 
                     composable(
                         route = WearRoutes.ARTIST_DETAIL_PATTERN,
-                        arguments = listOf(navArgument("rawArtists") { type = NavType.StringType })
+                        arguments = listOf(
+                            navArgument("rawArtists") { type = NavType.StringType },
+                            navArgument("artistId") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            }
+                        )
                     ) { entry ->
                         val encoded = entry.arguments?.getString("rawArtists").orEmpty()
                         val rawArtists = remember(encoded) { Uri.decode(encoded) }
-                        val artistFactory = remember(container, rawArtists) {
-                            ArtistViewModelFactory(container, rawArtists)
+                        val encodedArtistId = entry.arguments?.getString("artistId").orEmpty()
+                        val directArtistId = remember(encodedArtistId) { Uri.decode(encodedArtistId) }
+                        val artistFactory = remember(container, rawArtists, directArtistId) {
+                            ArtistViewModelFactory(container, rawArtists, directArtistId)
                         }
                         val artistVm: ArtistViewModel = viewModel(
                             viewModelStoreOwner = entry,
@@ -310,8 +321,8 @@ fun WearAppRoot(
                                 viewModel = artistVm,
                                 onClose = { navController.popBackStack() },
                                 onPlayed = returnToPlayer,
-                                onOpenSimilarArtist = { simName ->
-                                    navController.navigate(WearRoutes.artistDetail(simName))
+                                onOpenSimilarArtist = { simName, simId ->
+                                    navController.navigate(WearRoutes.artistDetail(simName, simId))
                                 },
                                 onToast = appViewModel::showToast
                             )

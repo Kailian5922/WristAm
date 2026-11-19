@@ -1,5 +1,6 @@
 package com.applemusic.lyricstool.wear.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -10,9 +11,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -20,7 +24,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -38,11 +44,13 @@ import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.FilledTonalIconButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.IconButtonDefaults
+import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.OutlinedButton
 import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
+import coil.compose.AsyncImage
 import com.applemusic.lyricstool.wear.ui.components.HorologistIcons
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
 import com.applemusic.lyricstool.wear.viewmodel.SearchViewModel
@@ -52,6 +60,7 @@ fun SearchScreen(
     viewModel: SearchViewModel,
     onBack: () -> Unit,
     onPlayed: () -> Unit,
+    onOpenArtist: (artistName: String, artistId: String) -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -128,6 +137,88 @@ fun SearchScreen(
                             .fillMaxWidth()
                             .padding(vertical = 8.dp)
                     )
+                }
+            }
+
+            if (!state.searchByLyrics && state.artists.isNotEmpty()) {
+                item(key = "search_artists_header") {
+                    ListHeader(modifier = Modifier.fillMaxWidth()) {
+                        Text("歌手", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+
+                itemsIndexed(
+                    items = state.artists,
+                    key = { index, artist -> "artist_${artist.id}_${artist.name}_$index" }
+                ) { _, artist ->
+                    Card(
+                        onClick = { onOpenArtist(artist.name, artist.id) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primaryContainer),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Person,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                if (artist.artworkUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = artist.artworkUrl,
+                                        contentDescription = artist.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = artist.name,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = artist.subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "进入歌手页",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (state.results.isNotEmpty() && !state.searchByLyrics && state.artists.isNotEmpty()) {
+                item(key = "search_songs_header") {
+                    ListHeader(modifier = Modifier.fillMaxWidth()) {
+                        Text("歌曲", style = MaterialTheme.typography.labelMedium)
+                    }
                 }
             }
 

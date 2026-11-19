@@ -1,6 +1,9 @@
-﻿// 从鸿蒙版 ArtistAliasTable.ets 自动提取的「本地名 → 目录规范名」对照表。
+// 从鸿蒙版 ArtistAliasTable.ets 自动提取的「本地名 → 目录规范名」对照表。
 // 用途：Apple 公开搜索只索引规范名（例：方大同 → Khalil Fong），中文别名命中差。
 package com.applemusic.android.apple
+
+import com.applemusic.android.util.ChineseText
+import java.text.Normalizer
 
 object ArtistAliasTable {
     private val PAIRS: Array<Array<String>> = arrayOf(
@@ -425,28 +428,488 @@ object ArtistAliasTable {
         arrayOf("班得瑞", "Bandari"),
     )
 
-    private val table: Map<String, String> by lazy {
-        val map = HashMap<String, String>()
-        for (p in PAIRS) {
-            if (p.size >= 2) {
-                map[normalize(p[0])] = p[1]
+    /** 补充高频中英双向歌手名及 Apple Music 双语合写展示名（每组最后一项通常为英文规范名）。 */
+    private val EXTRA_GROUPS: Array<Array<String>> = arrayOf(
+        // 补充 Apple Music 常见双语合写名与变体
+        arrayOf("邓紫棋", "G.E.M. 邓紫棋", "GEM", "G.E.M."),
+        arrayOf("热狗", "MC HotDog 热狗", "MC HotDog"),
+        arrayOf("飞儿乐团", "F.I.R. 飞儿乐团", "F.I.R."),
+        arrayOf("张惠妹", "A-Mei 张惠妹", "aMEI", "A-Mei"),
+        arrayOf("周延", "GAI周延", "GAI"),
+        arrayOf("宇多田光", "宇多田ヒカル", "Utada", "Utada Hikaru", "Hikaru Utada"),
+        arrayOf("米津玄师", "米津玄師", "Kenshi Yonezu"),
+        arrayOf("藤井风", "藤井 風", "藤井風", "Fujii Kaze"),
+        arrayOf("中岛美雪", "中島みゆき", "Miyuki Nakajima"),
+        arrayOf("许嵩", "Xu Song", "Vae"),
+        arrayOf("周深", "Charlie Zhou", "Zhou Shen"),
+        arrayOf("吴青峰", "Qing Feng Wu", "Wu Qing-Feng"),
+        arrayOf("泰勒·斯威夫特", "泰勒丝", "霉霉", "Taylor Swift"),
+        arrayOf("比莉·艾利什", "比利·艾利什", "碧梨", "Billie Eilish"),
+        arrayOf("艾德·希兰", "黄老板", "Ed Sheeran"),
+        arrayOf("布鲁诺·马尔斯", "布鲁诺·马斯", "火星哥", "Bruno Mars"),
+        arrayOf("阿黛尔", "爱黛儿", "Adele"),
+        arrayOf("碧昂丝", "碧昂斯", "Beyoncé"),
+        arrayOf("酷玩乐队", "酷玩", "Coldplay"),
+        arrayOf("披头士", "披头士乐队", "甲壳虫乐队", "The Beatles"),
+        arrayOf("迈克尔·杰克逊", "米高积逊", "Michael Jackson"),
+        arrayOf("爱我的", "G-IDLE", "GIDLE", "(G)I-DLE"),
+        // 欧美高频歌手中英对照
+        arrayOf("威肯", "盆栽哥", "The Weeknd"),
+        arrayOf("贾斯汀·比伯", "贾斯丁·比伯", "Justin Bieber"),
+        arrayOf("爱莉安娜·格兰德", "阿丽亚娜·格兰德", "Ariana Grande"),
+        arrayOf("蕾哈娜", "Rihanna"),
+        arrayOf("拉娜·德雷", "打雷姐", "Lana Del Rey"),
+        arrayOf("杜阿·利帕", "Dua Lipa"),
+        arrayOf("查理·普斯", "断眉", "Charlie Puth"),
+        arrayOf("肖恩·蒙德兹", "Shawn Mendes"),
+        arrayOf("赛琳娜·戈麦斯", "Selena Gomez"),
+        arrayOf("凯蒂·佩里", "水果姐", "Katy Perry"),
+        arrayOf("嘎嘎小姐", "女神卡卡", "Lady Gaga"),
+        arrayOf("萨布丽娜·卡彭特", "Sabrina Carpenter"),
+        arrayOf("奥利维亚·罗德里戈", "Olivia Rodrigo"),
+        arrayOf("哈里·斯泰尔斯", "Harry Styles"),
+        arrayOf("萨姆·史密斯", "Sam Smith"),
+        arrayOf("特洛耶·希文", "戳爷", "Troye Sivan"),
+        arrayOf("艾米纳姆", "埃米纳姆", "姆爷", "Eminem"),
+        arrayOf("坎耶·韦斯特", "肯伊·威斯特", "侃爷", "Kanye West"),
+        arrayOf("特拉维斯·斯科特", "Travis Scott"),
+        arrayOf("波兹·马龙", "Post Malone"),
+        arrayOf("艾薇儿", "艾薇儿·拉维尼", "Avril Lavigne"),
+        arrayOf("玛丽亚·凯莉", "Mariah Carey"),
+        arrayOf("席琳·迪翁", "席琳·狄翁", "Céline Dion", "Celine Dion"),
+        arrayOf("惠特尼·休斯顿", "惠妮·休斯顿", "Whitney Houston"),
+        arrayOf("烟鬼组合", "烟鬼", "The Chainsmokers"),
+        arrayOf("梦龙乐队", "想象龙", "Imagine Dragons"),
+        arrayOf("魔力红", "Maroon 5"),
+        arrayOf("共和时代", "OneRepublic"),
+        arrayOf("林肯公园", "Linkin Park"),
+        arrayOf("绿日乐队", "Green Day"),
+        arrayOf("绿洲乐队", "Oasis"),
+        arrayOf("西城男孩", "Westlife"),
+        arrayOf("后街男孩", "Backstreet Boys"),
+        arrayOf("单向乐队", "One Direction"),
+        arrayOf("艾伦·沃克", "Alan Walker"),
+        arrayOf("艾维奇", "Avicii"),
+        arrayOf("蠢朋克", "Daft Punk"),
+        arrayOf("麦莉·赛勒斯", "Miley Cyrus"),
+        arrayOf("卡米拉·卡贝洛", "Camila Cabello"),
+        arrayOf("希雅", "Sia"),
+        arrayOf("粉红佳人", "P!nk"),
+        arrayOf("豆荚猫", "Doja Cat"),
+        arrayOf("布兰妮", "布兰妮·斯皮尔斯", "Britney Spears"),
+        arrayOf("克里斯蒂娜·阿奎莱拉", "Christina Aguilera"),
+        arrayOf("贾斯汀·汀布莱克", "Justin Timberlake"),
+        arrayOf("夏奇拉", "Shakira"),
+        arrayOf("埃尔顿·约翰", "Elton John"),
+        arrayOf("约翰·梅尔", "John Mayer"),
+        arrayOf("杰森·玛耶兹", "Jason Mraz"),
+        arrayOf("猫王", "埃尔维斯·普雷斯利", "Elvis Presley"),
+        arrayOf("弗兰克·辛纳屈", "Frank Sinatra"),
+        arrayOf("金属乐队", "Metallica"),
+        arrayOf("枪炮与玫瑰", "枪花", "Guns N' Roses"),
+        arrayOf("邦乔维", "Bon Jovi"),
+        arrayOf("红辣椒乐队", "Red Hot Chili Peppers"),
+        arrayOf("北极猴", "Arctic Monkeys"),
+        arrayOf("缪斯乐队", "Muse"),
+        arrayOf("模糊乐队", "Blur"),
+        arrayOf("事后烟", "Cigarettes After Sex"),
+        arrayOf("林冰", "Laufey"),
+        // 华语/港台高频歌手中英对照
+        arrayOf("告五人", "Accusefive"),
+        arrayOf("草东没有派对", "No Party For Cao Dong"),
+        arrayOf("落日飞车", "Sunset Rollercoaster"),
+        arrayOf("橘子海", "Orange Ocean"),
+        arrayOf("回春丹", "Young Dan"),
+        arrayOf("单依纯", "Shan Yichun"),
+        arrayOf("黄霄云", "黄霄雲", "Ghost Huang"),
+        arrayOf("周兴哲", "Eric Chou"),
+        arrayOf("张韶涵", "Angela Chang"),
+        arrayOf("王心凌", "Cyndi Wang"),
+        arrayOf("杨丞琳", "Rainie Yang"),
+        arrayOf("萧亚轩", "Elva Hsiao"),
+        arrayOf("范玮琪", "Christine Fan"),
+        arrayOf("郭静", "Claire Kuo"),
+        arrayOf("郭采洁", "Amber Kuo"),
+        arrayOf("戴佩妮", "Penny Tai"),
+        arrayOf("黄丽玲", "A-Lin"),
+        arrayOf("胡彦斌", "Tiger Hu"),
+        arrayOf("张碧晨", "Diamond Zhang"),
+        arrayOf("王嘉尔", "Jackson Wang"),
+        arrayOf("刘宪华", "Henry Lau"),
+        arrayOf("周传雄", "Steve Chou"),
+        arrayOf("刀郎", "Dao Lang"),
+        arrayOf("凤凰传奇", "Phoenix Legend"),
+        arrayOf("张震岳", "Chang Chen-Yue", "A-Yue"),
+        arrayOf("郭顶", "Guo Ding"),
+        arrayOf("梁咏琪", "Gigi Leung"),
+        arrayOf("古巨基", "Leo Ku"),
+        arrayOf("陈小春", "Jordan Chan"),
+        arrayOf("郑伊健", "Ekin Cheng"),
+        arrayOf("林峰", "林峯", "Raymond Lam"),
+        arrayOf("张天赋", "MC 张天赋", "MC Cheung Tinfu"),
+        arrayOf("姜涛", "Keung To"),
+        arrayOf("冯允谦", "Jay Fung"),
+        arrayOf("洪嘉豪", "Kaho Hung"),
+        arrayOf("汤令山", "Gareth.T"),
+        arrayOf("陈蕾", "Panther Chan"),
+        arrayOf("泳儿", "Vincy Chan"),
+        arrayOf("薛凯琪", "Fiona Sit"),
+        arrayOf("陈柏宇", "Jason Chan"),
+        arrayOf("周国贤", "Endy Chow"),
+        arrayOf("张卫健", "Dicky Cheung"),
+        arrayOf("梁汉文", "Edmond Leung"),
+        arrayOf("梁朝伟", "Tony Leung"),
+        arrayOf("林志炫", "Terry Lin"),
+        arrayOf("胡夏", "Hu Xia"),
+        arrayOf("周笔畅", "Bibi Zhou"),
+        arrayOf("陈楚生", "Chen Chusheng"),
+        arrayOf("张远", "Bird Zhang"),
+        arrayOf("刘宇宁", "摩登兄弟刘宇宁", "Liu Yuning"),
+        arrayOf("颜人中", "Ele Yan"),
+        arrayOf("郑润泽", "Zheng Runze"),
+        arrayOf("队长", "YoungCaptain"),
+        arrayOf("魏如萱", "waa wei"),
+        arrayOf("安溥", "张悬", "焦安溥", "Anpu", "Deserts Chang"),
+        arrayOf("范晓萱", "Mavis Fan"),
+        arrayOf("许茹芸", "Valen Hsu"),
+        arrayOf("彭佳慧", "Julia Peng"),
+        arrayOf("苏慧伦", "Tarcy Su"),
+        arrayOf("江蕙", "Jody Chiang"),
+        arrayOf("萧煌奇", "Ricky Hsiao"),
+        arrayOf("齐豫", "Chyi Yu"),
+        arrayOf("陈淑桦", "Sarah Chen"),
+        arrayOf("许美静", "Mavis Hee"),
+        arrayOf("阿杜", "A-Do"),
+        arrayOf("阿桑", "A-Sun"),
+        arrayOf("崔健", "Cui Jian"),
+        arrayOf("窦唯", "Dou Wei"),
+        arrayOf("唐朝乐队", "Tang Dynasty"),
+        arrayOf("羽泉", "Yu Quan"),
+        arrayOf("大张伟", "Wowkie Zhang"),
+        arrayOf("徐小凤", "Paula Tsui"),
+        arrayOf("罗文", "Roman Tam"),
+        arrayOf("卢冠廷", "Lowell Lo"),
+        arrayOf("茄子蛋", "EggPlantEgg"),
+        arrayOf("鱼丁糸", "oaeen"),
+        arrayOf("八三夭", "831"),
+        arrayOf("时代少年团", "Teens in Times"),
+        arrayOf("肖战", "Xiao Zhan"),
+        arrayOf("王一博", "Wang Yibo"),
+        arrayOf("宋雨琦", "YUQI"),
+        arrayOf("高尔宣", "OSN"),
+        arrayOf("瘦子", "瘦子E.SO", "E.SO"),
+        arrayOf("顽童MJ116", "MJ116"),
+        arrayOf("夏日入侵企画", "SummerVapour"),
+        arrayOf("傻子与白痴", "Fool and Idiot"),
+        arrayOf("椅子乐团", "The Chairs"),
+        arrayOf("重塑雕像的权利", "Re-TROS"),
+        arrayOf("旅行团乐队", "The LifeJourney"),
+        arrayOf("盘尼西林", "Penicillin"),
+        arrayOf("南拳妈妈", "Nan Quan Mama"),
+        arrayOf("严爵", "Yen-j"),
+        arrayOf("庄心妍", "Ada Zhuang"),
+        arrayOf("江海迦", "AGA"),
+        arrayOf("李幸倪", "Gin Lee"),
+        arrayOf("杜德伟", "Alex To"),
+        arrayOf("林志颖", "Jimmy Lin"),
+    )
+
+    /** 常见日语新字体汉字 → 简体字折叠表（补齐 ICU Traditional-Simplified 不转换的日语新字体差异）。 */
+    private val SHINJITAI_TO_SIMPLIFIED: Map<Char, Char> = mapOf(
+        '亜' to '亚', '円' to '圆', '応' to '应', '仮' to '假', '価' to '价',
+        '絵' to '绘', '覚' to '觉', '観' to '观', '顔' to '颜', '帰' to '归',
+        '気' to '气', '響' to '响', '暁' to '晓', '剣' to '剑', '険' to '险',
+        '顕' to '显', '験' to '验', '厳' to '严', '広' to '广', '黒' to '黑',
+        '歳' to '岁', '桜' to '樱', '雑' to '杂', '産' to '产', '児' to '儿',
+        '実' to '实', '釈' to '释', '従' to '从', '渋' to '涩', '獣' to '兽',
+        '縦' to '纵', '処' to '处', '焼' to '烧', '浄' to '净', '譲' to '让',
+        '図' to '图', '酔' to '醉', '穂' to '穗', '瀬' to '濑', '斉' to '齐',
+        '斎' to '斋', '専' to '专', '戦' to '战', '繊' to '纤', '総' to '总',
+        '騒' to '骚', '増' to '增', '臓' to '脏', '蔵' to '藏', '続' to '续',
+        '対' to '对', '帯' to '带', '滝' to '泷', '択' to '择', '沢' to '泽',
+        '単' to '单', '団' to '团', '弾' to '弹', '遅' to '迟', '聴' to '听',
+        '鉄' to '铁', '転' to '转', '伝' to '传', '闘' to '斗', '徳' to '德',
+        '読' to '读', '縄' to '绳', '悩' to '恼', '脳' to '脑', '拝' to '拜',
+        '廃' to '废', '売' to '卖', '発' to '发', '抜' to '拔', '晩' to '晚',
+        '浜' to '滨', '仏' to '佛', '並' to '并', '変' to '变', '辺' to '边',
+        '舗' to '铺', '歩' to '步', '豊' to '丰', '毎' to '每', '満' to '满',
+        '黙' to '默', '薬' to '药', '訳' to '译', '揺' to '摇', '様' to '样',
+        '頼' to '赖', '覧' to '览', '竜' to '龙', '両' to '两', '緑' to '绿',
+        '涙' to '泪', '霊' to '灵', '齢' to '龄', '歴' to '历', '労' to '劳',
+        '恵' to '惠', '楽' to '乐', '関' to '关', '栄' to '荣', '蛍' to '萤',
+        '亀' to '龟'
+    )
+
+    private val PAREN_BILINGUAL_REGEX = Regex("""^(.+?)\s*[(（]([^()（）]+)[)）]\s*$""")
+
+    private class BuiltIndex(
+        val canonicalTable: Map<String, String>,
+        val groupsByKey: Map<String, List<String>>
+    )
+
+    private val index: BuiltIndex by lazy { buildIndex() }
+
+    private fun buildIndex(): BuiltIndex {
+        val canonical = HashMap<String, String>()
+        val parent = HashMap<String, String>()
+        val displayByKey = LinkedHashMap<String, String>()
+
+        fun find(x: String): String {
+            var cur = x
+            while (parent[cur] != cur) {
+                cur = parent[cur] ?: break
+            }
+            var node = x
+            while (parent[node] != null && parent[node] != cur) {
+                val next = parent[node]!!
+                parent[node] = cur
+                node = next
+            }
+            return cur
+        }
+
+        fun registerKey(raw: String): String {
+            val key = normalizeKey(raw)
+            if (key.isEmpty()) return ""
+            if (key !in parent) parent[key] = key
+            if (key !in displayByKey) displayByKey[key] = raw.trim()
+            return key
+        }
+
+        fun union(a: String, b: String) {
+            if (a.isEmpty() || b.isEmpty()) return
+            val ra = find(a)
+            val rb = find(b)
+            if (ra != rb) parent[rb] = ra
+        }
+
+        fun ingestGroup(group: Array<String>) {
+            if (group.size < 2) return
+            val keys = group.mapNotNull { raw -> registerKey(raw).takeIf { it.isNotEmpty() } }
+            if (keys.isEmpty()) return
+            val root = keys.first()
+            for (i in 1 until keys.size) {
+                union(root, keys[i])
+            }
+            val canonicalName = group.last().trim()
+            val canonicalKey = normalizeKey(canonicalName)
+            if (canonicalKey.isNotEmpty()) {
+                for (i in 0 until group.size - 1) {
+                    val localKey = normalizeKey(group[i])
+                    if (localKey.isNotEmpty() && localKey != canonicalKey) {
+                        canonical[localKey] = canonicalName
+                    }
+                }
             }
         }
-        map
+
+        for (p in PAIRS) ingestGroup(p)
+        for (g in EXTRA_GROUPS) ingestGroup(g)
+
+        val buckets = LinkedHashMap<String, ArrayList<String>>()
+        for ((key, raw) in displayByKey) {
+            val root = find(key)
+            buckets.getOrPut(root) { ArrayList() }.add(raw)
+        }
+
+        val groupsByKey = HashMap<String, List<String>>(displayByKey.size * 2)
+        for ((key, _) in displayByKey) {
+            val members = buckets[find(key)] ?: continue
+            groupsByKey[key] = members
+        }
+
+        return BuiltIndex(
+            canonicalTable = canonical,
+            groupsByKey = groupsByKey
+        )
     }
 
-    private fun normalize(text: String): String {
-        val sb = StringBuilder()
-        for (ch in text.lowercase()) {
-            if (ch == ' ' || ch == '·' || ch == '・' || ch == '•' || ch == '.' || ch == ',' || ch == '-') continue
+    @JvmStatic
+    fun hasHanCharacters(text: String): Boolean =
+        text.any { it in '\u3400'..'\u9FFF' || it in '\uF900'..'\uFAFF' }
+
+    @JvmStatic
+    fun hasJapaneseKana(text: String): Boolean =
+        text.any { it in '\u3040'..'\u309F' || it in '\u30A0'..'\u30FF' || it in '\uFF66'..'\uFF9F' }
+
+    @JvmStatic
+    fun hasLatinLetters(text: String): Boolean =
+        text.any { it in 'A'..'Z' || it in 'a'..'z' || it in '\u00C0'..'\u024F' }
+
+    /**
+     * 精准匹配用归一化键：
+     * - 繁转简 + 常见日语新字体折叠；
+     * - 仅剥离拉丁组合重音符（保留日语浊音/半浊音仮名不变）；
+     * - 忽略大小写、空白、中点及常见装饰标点。
+     */
+    @JvmStatic
+    fun normalizeKey(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return ""
+        val simplified = ChineseText.toSimplified(trimmed)
+        val nfkc = Normalizer.normalize(simplified, Normalizer.Form.NFKC)
+        val nfkd = Normalizer.normalize(nfkc, Normalizer.Form.NFKD)
+        val strippedAccents = StringBuilder(nfkd.length)
+        for (ch in nfkd) {
+            // 只移除拉丁组合重音符（U+0300..U+036F），保留日语浊点/半浊点（U+3099..U+309A）
+            if (ch in '\u0300'..'\u036F') continue
+            strippedAccents.append(ch)
+        }
+        val composed = Normalizer.normalize(strippedAccents.toString(), Normalizer.Form.NFC)
+        val sb = StringBuilder(composed.length)
+        for (rawCh in composed) {
+            val mapped = SHINJITAI_TO_SIMPLIFIED[rawCh] ?: rawCh
+            val ch = mapped.lowercaseChar()
+            when (ch) {
+                'ø' -> {
+                    sb.append('o')
+                    continue
+                }
+                'ł' -> {
+                    sb.append('l')
+                    continue
+                }
+                'đ' -> {
+                    sb.append('d')
+                    continue
+                }
+                'æ' -> {
+                    sb.append("ae")
+                    continue
+                }
+                'œ' -> {
+                    sb.append("oe")
+                    continue
+                }
+                'ß' -> {
+                    sb.append("ss")
+                    continue
+                }
+            }
+            if (Character.isWhitespace(ch) ||
+                ch == '·' || ch == '・' || ch == '•' || ch == '‧' || ch == '･' ||
+                ch == '.' || ch == ',' || ch == '-' || ch == '_' ||
+                ch == '~' || ch == '～' || ch == '—' || ch == '–' ||
+                ch == '\'' || ch == '’' || ch == '‘' || ch == '`' ||
+                ch == '。' || ch == '、' || ch == '，' ||
+                ch == '!' || ch == '！'
+            ) {
+                continue
+            }
             sb.append(ch)
         }
         return sb.toString()
     }
 
-    /** 命中返回目录规范名，未命中返回空串。 */
+    /** 命中返回目录规范名（主要用于中文名 → 英文规范名检索），未命中返回空串。 */
     @JvmStatic
-    fun lookup(term: String): String = table[normalize(term)] ?: ""
+    fun lookup(term: String): String {
+        val key = normalizeKey(term)
+        if (key.isEmpty()) return ""
+        return index.canonicalTable[key] ?: ""
+    }
 
-    fun size(): Int = table.size
+    /** 双向查询该歌手的等价别名组（中文名 ↔ 英文名）。 */
+    @JvmStatic
+    fun aliasesOf(term: String): List<String> {
+        val key = normalizeKey(term)
+        if (key.isEmpty()) return emptyList()
+        return index.groupsByKey[key] ?: emptyList()
+    }
+
+    /** 返回与当前输入不同规范键的跨语种候选搜索词（优先返回另一语种主名称）。 */
+    @JvmStatic
+    fun alternateSearchTerms(term: String): List<String> {
+        val queryKey = normalizeKey(term)
+        if (queryKey.isEmpty()) return emptyList()
+        val aliases = index.groupsByKey[queryKey] ?: return emptyList()
+        val queryHasHan = hasHanCharacters(term)
+        val queryHasLatin = hasLatinLetters(term) && !queryHasHan
+
+        val preferred = ArrayList<String>()
+        val fallback = ArrayList<String>()
+        val seenKeys = HashSet<String>().apply { add(queryKey) }
+
+        val canonical = index.canonicalTable[queryKey]
+        if (!canonical.isNullOrBlank()) {
+            val cKey = normalizeKey(canonical)
+            if (seenKeys.add(cKey)) preferred.add(canonical)
+        }
+
+        for (alias in aliases) {
+            val aKey = normalizeKey(alias)
+            if (aKey.isEmpty() || !seenKeys.add(aKey)) continue
+            val isOppositeScript = when {
+                queryHasHan -> hasLatinLetters(alias) && !hasHanCharacters(alias)
+                queryHasLatin -> hasHanCharacters(alias)
+                else -> true
+            }
+            if (isOppositeScript) preferred.add(alias) else fallback.add(alias)
+        }
+        return preferred + fallback
+    }
+
+    /** 计算输入查询词允许精准命中的所有归一化键集合。 */
+    @JvmStatic
+    fun exactTargetKeys(query: String): Set<String> {
+        val queryKey = normalizeKey(query)
+        if (queryKey.isEmpty()) return emptySet()
+        val keys = LinkedHashSet<String>()
+        keys.add(queryKey)
+        for (alias in aliasesOf(query)) {
+            val aKey = normalizeKey(alias)
+            if (aKey.isNotEmpty()) keys.add(aKey)
+        }
+        return keys
+    }
+
+    /** 提取艺人显示名的可精准比对变体（含跨语种括号合写，如「周杰伦 (Jay Chou)」）。 */
+    @JvmStatic
+    fun extractCandidateNameVariants(name: String): List<String> {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        val variants = ArrayList<String>(3)
+        variants.add(trimmed)
+        val match = PAREN_BILINGUAL_REGEX.matchEntire(trimmed)
+        if (match != null) {
+            val outer = match.groupValues[1].trim()
+            val inner = match.groupValues[2].trim()
+            val outerCjk = hasHanCharacters(outer) || hasJapaneseKana(outer)
+            val innerCjk = hasHanCharacters(inner) || hasJapaneseKana(inner)
+            val outerLatin = hasLatinLetters(outer) && !outerCjk
+            val innerLatin = hasLatinLetters(inner) && !innerCjk
+            if ((outerCjk && innerLatin) || (outerLatin && innerCjk)) {
+                if (outer.isNotEmpty()) variants.add(outer)
+                if (inner.isNotEmpty()) variants.add(inner)
+            }
+        }
+        return variants
+    }
+
+    /** 判断候选艺人名是否精准匹配 [targetKeys]（支持双向中英等价组与日语原名）。 */
+    @JvmStatic
+    fun matchesTargetKeys(candidateName: String, targetKeys: Set<String>): Boolean {
+        if (targetKeys.isEmpty() || candidateName.isBlank()) return false
+        for (variant in extractCandidateNameVariants(candidateName)) {
+            val key = normalizeKey(variant)
+            if (key.isEmpty()) continue
+            if (key in targetKeys) return true
+            val group = index.groupsByKey[key]
+            if (group != null) {
+                for (alias in group) {
+                    val aKey = normalizeKey(alias)
+                    if (aKey.isNotEmpty() && aKey in targetKeys) return true
+                }
+            }
+        }
+        return false
+    }
+
+    @JvmStatic
+    fun matchesArtistName(candidateName: String, query: String): Boolean {
+        val targetKeys = exactTargetKeys(query)
+        return targetKeys.isNotEmpty() && matchesTargetKeys(candidateName, targetKeys)
+    }
+
+    fun size(): Int = index.canonicalTable.size
 }

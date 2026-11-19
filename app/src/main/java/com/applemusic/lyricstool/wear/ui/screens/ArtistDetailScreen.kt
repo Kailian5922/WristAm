@@ -54,7 +54,7 @@ fun ArtistDetailScreen(
     viewModel: ArtistViewModel,
     onClose: () -> Unit,
     onPlayed: () -> Unit,
-    onOpenSimilarArtist: (String) -> Unit,
+    onOpenSimilarArtist: (String, String) -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -514,7 +514,7 @@ fun ArtistDetailScreen(
                     key = { _, sim -> "sim_${sim.id}_${sim.name}" }
                 ) { _, simArtist ->
                     Card(
-                        onClick = { onOpenSimilarArtist(simArtist.name) },
+                        onClick = { onOpenSimilarArtist(simArtist.name, simArtist.id) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)

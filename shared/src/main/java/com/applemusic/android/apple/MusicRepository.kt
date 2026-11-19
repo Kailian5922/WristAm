@@ -291,9 +291,11 @@ object MusicRepository {
     fun searchCatalog(term: String, limit: Int = 25): AppleSearchResult = api.search(term, limit)
 
     fun searchLocal(term: String): AppleSearchResult {
-        val t = term.trim().lowercase(Locale.ROOT)
+        val rawTerm = term.trim()
+        val t = rawTerm.lowercase(Locale.ROOT)
         val out = AppleSearchResult()
         if (t.isBlank()) return out
+        val targetKeys = ArtistAliasTable.exactTargetKeys(rawTerm)
         val songsSnap: List<AppleLibrarySync.SongRow>
         val albumsSnap: List<AlbumAgg>
         val artistsSnap: List<ArtistAgg>
@@ -304,16 +306,24 @@ object MusicRepository {
             artistsSnap = artistList
             playlistsSnap = playlists.toList()
         }
+        val artistIdByName = HashMap<String, String>()
         for (s in songsSnap) {
+            if (s.artist.isNotBlank() && s.artistId.isNotBlank() && s.artist !in artistIdByName) {
+                artistIdByName[s.artist] = s.artistId
+            }
             if (s.title.lowercase(Locale.ROOT).contains(t) ||
                 s.artist.lowercase(Locale.ROOT).contains(t) ||
-                s.album.lowercase(Locale.ROOT).contains(t)
+                s.album.lowercase(Locale.ROOT).contains(t) ||
+                ArtistAliasTable.matchesTargetKeys(s.artist, targetKeys)
             ) {
                 out.songs.add(songFromRow(s))
             }
         }
         for (a in albumsSnap) {
-            if (a.name.lowercase(Locale.ROOT).contains(t) || a.artist.lowercase(Locale.ROOT).contains(t)) {
+            if (a.name.lowercase(Locale.ROOT).contains(t) ||
+                a.artist.lowercase(Locale.ROOT).contains(t) ||
+                ArtistAliasTable.matchesTargetKeys(a.artist, targetKeys)
+            ) {
                 out.albums.add(
                     AppleAlbum(
                         name = a.name,
@@ -327,13 +337,17 @@ object MusicRepository {
             }
         }
         for (ar in artistsSnap) {
-            if (ar.name.lowercase(Locale.ROOT).contains(t)) {
+            if (ar.name.lowercase(Locale.ROOT).contains(t) ||
+                ArtistAliasTable.matchesTargetKeys(ar.name, targetKeys)
+            ) {
                 out.artists.add(
                     AppleArtist(
+                        id = artistIdByName[ar.name].orEmpty(),
                         name = ar.name,
                         artworkUrl = ar.coverUrl,
                         songCount = ar.songCount,
-                        albumCount = ar.albumCount
+                        albumCount = ar.albumCount,
+                        genreNames = ar.genre.takeIf { it.isNotBlank() }?.let { listOf(it) } ?: emptyList()
                     )
                 )
             }
@@ -353,6 +367,25 @@ object MusicRepository {
         return out
     }
 
+    /** 按精准艺名或双语别名从本地资料库查找已缓存的艺人头像 URL。 */
+    fun findLocalArtistAvatar(artistName: String): String {
+        val targetKeys = ArtistAliasTable.exactTargetKeys(artistName)
+        if (targetKeys.isEmpty()) return ""
+        synchronized(dataLock) {
+            for ((name, url) in avatars) {
+                if (url.isNotBlank() && ArtistAliasTable.matchesTargetKeys(name, targetKeys)) {
+                    return url
+                }
+            }
+            for (ar in artistList) {
+                if (ar.coverUrl.isNotBlank() && ArtistAliasTable.matchesTargetKeys(ar.name, targetKeys)) {
+                    return ar.coverUrl
+                }
+            }
+        }
+        return ""
+    }
+
     fun urisOf(rows: List<AppleLibrarySync.SongRow>): List<String> = rows.map { it.uri }
 
     fun remapQueue(uris: List<String>): List<String> {
@@ -368,14 +401,16 @@ object MusicRepository {
         return albumList.firstOrNull { it.name == name && it.artist == artist }?.songs?.toList() ?: emptyList()
     }
 
-    /** 查找资料库中该艺人的曲目（同时匹配单艺人及合作曲目）。 */
+    /** 查找资料库中该艺人的曲目（同时匹配单艺人、双语别名及合作曲目）。 */
     fun songsOfArtist(name: String): List<AppleLibrarySync.SongRow> {
         val target = name.trim()
         if (target.isEmpty()) return emptyList()
+        val targetKeys = ArtistAliasTable.exactTargetKeys(target)
         return synchronized(dataLock) {
             songs.filter { row ->
                 row.artist.equals(target, ignoreCase = true) ||
-                    row.artist.contains(target, ignoreCase = true)
+                    row.artist.contains(target, ignoreCase = true) ||
+                    ArtistAliasTable.matchesTargetKeys(row.artist, targetKeys)
             }.sortedWith(compareBy({ it.album }, { it.discNumber }, { it.trackNumber }))
         }
     }
