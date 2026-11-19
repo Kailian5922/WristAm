@@ -1,5 +1,6 @@
 package com.applemusic.lyricstool.wear.ui.screens
 
+import android.os.Build
 import android.os.SystemClock
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -58,9 +59,11 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
@@ -269,10 +272,7 @@ private class WearLyricsPageState(
         val visibleItem = layoutInfo.visibleItemsInfo.firstOrNull { it.index == listItemIndex }
 
         if (visibleItem != null) {
-            val viewportStart = layoutInfo.viewportStartOffset.toFloat()
-            val viewportEnd = layoutInfo.viewportEndOffset.toFloat()
-            val viewportHeight = viewportEnd - viewportStart
-            val targetCenter = viewportStart + (viewportHeight * 0.45f)
+            val targetCenter = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2f
             val itemCenter = visibleItem.offset + (visibleItem.size / 2f)
             val scrollDelta = itemCenter - targetCenter
 
@@ -289,10 +289,7 @@ private class WearLyricsPageState(
             val updatedLayout = listState.layoutInfo
             val nowVisible = updatedLayout.visibleItemsInfo.firstOrNull { it.index == listItemIndex }
             if (nowVisible != null) {
-                val viewportStart = updatedLayout.viewportStartOffset.toFloat()
-                val viewportEnd = updatedLayout.viewportEndOffset.toFloat()
-                val viewportHeight = viewportEnd - viewportStart
-                val targetCenter = viewportStart + (viewportHeight * 0.45f)
+                val targetCenter = (updatedLayout.viewportStartOffset + updatedLayout.viewportEndOffset) / 2f
                 val itemCenter = nowVisible.offset + (nowVisible.size / 2f)
                 val scrollDelta = itemCenter - targetCenter
                 if (abs(scrollDelta) > 1.5f) {
@@ -553,8 +550,30 @@ private fun AppleMusicKaraokeSweepText(
 }
 
 /**
+ * 计算歌词行距当前播放行的景深模糊半径（单位 dp）：
+ * - 非同步歌词、用户滑动/旋转表冠浏览期间、或当前播放行保持 0dp 完全清晰；
+ * - 从当前播放行向上下逐行递增模糊（距离越远越模糊），并设上限兼顾手表 GPU 帧率。
+ */
+private fun computeLyricBlurRadiusDp(
+    isSynced: Boolean,
+    isUserBrowsingLyrics: Boolean,
+    distanceFromActive: Int
+): Float {
+    if (!isSynced || isUserBrowsingLyrics || distanceFromActive <= 0) return 0f
+    return when (distanceFromActive) {
+        1 -> 1.4f
+        2 -> 2.8f
+        3 -> 4.2f
+        4 -> 5.4f
+        else -> 6.0f
+    }
+}
+
+/**
  * 单行歌词条目：
  * - 单次 alpha 渲染（彻底修复 graphicsLayer 与 Text 颜色双重相乘导致邻近行暗淡的问题）；
+ * - 以当前播放行为焦点向上下逐行递增景深模糊（API 31+ GPU RenderEffect），手动滑动/表冠浏览时即时解除模糊；
+ * - 动画值延迟至 graphicsLayer 绘制期读取，避免逐帧重组；
  * - 保持紧凑间距（当前行 3.dp，非当前行 1.dp）与强调色主题风格；
  * - 非时间轴歌词（!isSynced）下全行清晰展示且禁用无效跳转。
  */
@@ -576,7 +595,7 @@ private fun AppleMusicLyricLineItem(
     onClick: () -> Unit
 ) {
     val targetScale = if (!isSynced || isActive) 1.0f else 0.90f
-    val animatedScale by animateFloatAsState(
+    val scaleState = animateFloatAsState(
         targetValue = targetScale,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioLowBouncy,
@@ -589,14 +608,32 @@ private fun AppleMusicLyricLineItem(
         !isSynced -> 0.92f
         isUserBrowsingLyrics -> 0.96f
         isActive -> 1.0f
-        distanceFromActive == 1 -> if (isPast) 0.56f else 0.64f
-        distanceFromActive == 2 -> 0.38f
-        else -> 0.24f
+        distanceFromActive == 1 -> if (isPast) 0.62f else 0.72f
+        distanceFromActive == 2 -> 0.48f
+        distanceFromActive == 3 -> 0.36f
+        else -> 0.26f
     }
-    val animatedAlpha by animateFloatAsState(
+    val alphaState = animateFloatAsState(
         targetValue = targetAlpha,
-        animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+        animationSpec = tween(
+            durationMillis = if (isUserBrowsingLyrics) 160 else 300,
+            easing = FastOutSlowInEasing
+        ),
         label = "lyricAlpha"
+    )
+
+    val targetBlurDp = computeLyricBlurRadiusDp(
+        isSynced = isSynced,
+        isUserBrowsingLyrics = isUserBrowsingLyrics,
+        distanceFromActive = distanceFromActive
+    )
+    val blurDpState = animateFloatAsState(
+        targetValue = targetBlurDp,
+        animationSpec = tween(
+            durationMillis = if (isUserBrowsingLyrics) 160 else 360,
+            easing = FastOutSlowInEasing
+        ),
+        label = "lyricBlur"
     )
 
     val interactionSource = remember { MutableInteractionSource() }
@@ -611,10 +648,20 @@ private fun AppleMusicLyricLineItem(
                 }
             }
             .graphicsLayer {
-                scaleX = animatedScale
-                scaleY = animatedScale
-                alpha = animatedAlpha
+                scaleX = scaleState.value
+                scaleY = scaleState.value
+                alpha = alphaState.value
                 transformOrigin = TransformOrigin.Center
+                val blurPx = blurDpState.value * density
+                renderEffect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurPx > 0.5f) {
+                    BlurEffect(
+                        radiusX = blurPx,
+                        radiusY = blurPx,
+                        edgeTreatment = TileMode.Decal
+                    )
+                } else {
+                    null
+                }
             }
             .clip(RoundedCornerShape(8.dp))
             .clickable(
@@ -699,6 +746,7 @@ private fun WearLyricsPage(
     lyrics: List<LyricLine>,
     isSynced: Boolean,
     isPlaying: Boolean,
+    isVisible: Boolean,
     positionProvider: () -> Long,
     activeLineIndex: Int,
     isUserBrowsingLyrics: Boolean,
@@ -724,11 +772,13 @@ private fun WearLyricsPage(
         modifier = modifier.fillMaxSize()
     ) {
         val viewportHeightDp = maxHeight
-        // 上留 45%、下留 55%，确保首句与末句均可精确滚动至 45% 光学黄金中心
-        val topPadding = (viewportHeightDp * 0.45f).coerceAtLeast(88.dp)
-        val bottomPadding = (viewportHeightDp * 0.55f).coerceAtLeast(112.dp)
+        // 上下各留 50% 视口高度，确保首句、中间句与末句（含歌名标题头时）均可精准停靠在垂直正中央
+        val verticalCenterPadding = (viewportHeightDp * 0.50f).coerceAtLeast(96.dp)
+        val topPadding = if (isSynced) verticalCenterPadding else (viewportHeightDp * 0.18f).coerceAtLeast(36.dp)
+        val bottomPadding = verticalCenterPadding
 
         LaunchedEffect(
+            isVisible,
             activeLineIndex,
             lyrics,
             isSynced,
@@ -737,7 +787,7 @@ private fun WearLyricsPage(
             fontScaleFactor,
             showTranslation
         ) {
-            if (isSynced && !isUserBrowsingLyrics && lyrics.isNotEmpty() && activeLineIndex >= 0) {
+            if (isVisible && isSynced && !isUserBrowsingLyrics && lyrics.isNotEmpty() && activeLineIndex >= 0) {
                 pageState.smoothCenterOnItem(
                     listItemIndex = activeLineIndex + headerCount,
                     totalItems = lyrics.size + headerCount
@@ -751,7 +801,7 @@ private fun WearLyricsPage(
             contentPadding = PaddingValues(
                 start = 12.dp,
                 end = 12.dp,
-                top = if (hasHeader) (viewportHeightDp * 0.18f).coerceAtLeast(36.dp) else topPadding,
+                top = topPadding,
                 bottom = bottomPadding
             ),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -765,8 +815,8 @@ private fun WearLyricsPage(
                     drawRect(
                         brush = Brush.verticalGradient(
                             0.0f to Color.Transparent,
-                            0.18f to Color.Black,
-                            0.80f to Color.Black,
+                            0.16f to Color.Black,
+                            0.84f to Color.Black,
                             1.0f to Color.Transparent
                         ),
                         blendMode = BlendMode.DstIn
@@ -776,10 +826,36 @@ private fun WearLyricsPage(
             if (hasHeader) {
                 val headerSong = song!!
                 item(key = "lyrics_song_header_${headerSong.id}") {
+                    val headerDistance = if (isSynced && activeLineIndex >= 0) activeLineIndex + 1 else 0
+                    val headerTargetBlurDp = computeLyricBlurRadiusDp(
+                        isSynced = isSynced,
+                        isUserBrowsingLyrics = isUserBrowsingLyrics,
+                        distanceFromActive = headerDistance
+                    )
+                    val headerBlurDpState = animateFloatAsState(
+                        targetValue = headerTargetBlurDp,
+                        animationSpec = tween(
+                            durationMillis = if (isUserBrowsingLyrics) 160 else 360,
+                            easing = FastOutSlowInEasing
+                        ),
+                        label = "headerBlur"
+                    )
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .graphicsLayer {
+                                val blurPx = headerBlurDpState.value * density
+                                renderEffect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && blurPx > 0.5f) {
+                                    BlurEffect(
+                                        radiusX = blurPx,
+                                        radiusY = blurPx,
+                                        edgeTreatment = TileMode.Decal
+                                    )
+                                } else {
+                                    null
+                                }
+                            }
                             .padding(bottom = 10.dp)
                     ) {
                         Text(
@@ -817,7 +893,7 @@ private fun WearLyricsPage(
             ) { index, line ->
                 val isCurrentActive = isSynced && index == activeLineIndex
                 val isPastLine = isSynced && index < activeLineIndex
-                val distanceFromActive = if (isSynced) abs(index - activeLineIndex) else 0
+                val distanceFromActive = if (isSynced && activeLineIndex >= 0) abs(index - activeLineIndex) else 0
 
                 AppleMusicLyricLineItem(
                     line = line,
@@ -846,6 +922,8 @@ private fun WearLyricsPage(
  * 完整级现代 Wear OS 逐字歌词界面：
  * - 响应式播放状态与 seek 修订监听；
  * - 绘制期 30fps 平滑逐字扫光，列表零重组；
+ * - 以当前播放行为焦点向上下逐行递增景深模糊，触摸拖动或表冠/表圈滑动时即时解除模糊；
+ * - 播放行精确居中停靠于屏幕垂直正中央（50% 视口中点）；
  * - 原生 Wear OS 表冠 / 三星模拟与物理表圈滚动（rotaryScrollable + 惯性滑动 + 三星触觉反馈 + 分层焦点协同）；
  * - 拖动或表冠惯性滚动完全停止后再计时 3.5 秒自动回正；
  * - 保持用户偏好的紧凑行距、强调色高亮与动态专辑模糊背景。
@@ -1007,6 +1085,7 @@ fun LyricsScreen(
                         lyrics = lines,
                         isSynced = isSynced,
                         isPlaying = state.isPlaying,
+                        isVisible = isVisible,
                         positionProvider = { smoothPositionState.value },
                         activeLineIndex = activeLineIndex,
                         isUserBrowsingLyrics = isUserBrowsingLyrics,
