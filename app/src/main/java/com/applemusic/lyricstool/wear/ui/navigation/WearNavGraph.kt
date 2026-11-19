@@ -55,6 +55,7 @@ import com.applemusic.lyricstool.wear.viewmodel.PlaylistDetailViewModelFactory
 import com.applemusic.lyricstool.wear.viewmodel.RadioViewModel
 import com.applemusic.lyricstool.wear.viewmodel.SearchViewModel
 import com.applemusic.lyricstool.wear.viewmodel.WearViewModelFactory
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 @Composable
@@ -88,11 +89,7 @@ fun WearAppRoot(
     val navController = rememberSwipeDismissableNavController()
     val pagerState = rememberPagerState(initialPage = 0, pageCount = { 3 })
     val scope = rememberCoroutineScope()
-    val backStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = backStackEntry?.destination?.route ?: WearRoutes.MAIN
-
-    val onLyricsPage = currentRoute == WearRoutes.MAIN &&
-        (pagerState.currentPage == 1 || pagerState.targetPage == 1)
+    val backStackEntryState = navController.currentBackStackEntryAsState()
 
     val returnToPlayer: () -> Unit = {
         navController.popBackStack(WearRoutes.MAIN, inclusive = false)
@@ -111,96 +108,107 @@ fun WearAppRoot(
     MaterialTheme(colorScheme = dynamicColorScheme) {
         AppScaffold {
             Box(modifier = Modifier.fillMaxSize()) {
-                // 全局共享动态高斯模糊专辑封面背景（所有子页均继承同一主题与封面，歌词页自动叠加柔和暗化护目遮罩）
-                HorologistArtworkBackground(
-                    artworkUrl = artworkUrl,
-                    scrimAlpha = if (onLyricsPage) 0.24f else 0f
-                )
-
+                // SwipeDismissableNavHost 内部 BasicSwipeToDismissBox 会为每个目标页铺一层不透明底色，
+                // 因此背景必须渲染在每个 composable 目标内部（既不被遮挡，侧滑返回时也不会透底重影）。
+                // 同时通过 StateFlow / State 在目标内部读取，避免被 SwipeDismissableNavHost 记住的 builder 捕获旧值。
                 SwipeDismissableNavHost(
                     navController = navController,
                     startDestination = WearRoutes.MAIN,
                     modifier = Modifier.fillMaxSize()
                 ) {
                     composable(WearRoutes.MAIN) {
-                        HorizontalPagerScaffold(
-                            pagerState = pagerState,
-                            modifier = Modifier.fillMaxSize(),
-                            pageIndicator = {
-                                HorizontalPageIndicator(
-                                    pagerState = pagerState,
-                                    modifier = Modifier.padding(bottom = 4.dp)
-                                )
-                            }
-                        ) { page ->
-                            when (page) {
-                                0 -> PlayerScreen(
-                                    viewModel = playerViewModel,
-                                    isVisible = currentRoute == WearRoutes.MAIN && pagerState.currentPage == 0,
-                                    onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
-                                    onOpenArtist = openArtistFlow,
-                                    onToast = appViewModel::showToast
-                                )
-                                1 -> LyricsScreen(
-                                    viewModel = lyricsViewModel,
-                                    isVisible = onLyricsPage
-                                )
-                                2 -> BrowseMenuScreen(
-                                    viewModel = browseViewModel,
-                                    onOpenRadio = { navController.navigate(WearRoutes.RADIO) },
-                                    onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
-                                    onOpenLibrarySongs = { navController.navigate(WearRoutes.LIBRARY_SONGS) },
-                                    onOpenPlaylists = { navController.navigate(WearRoutes.PLAYLISTS) },
-                                    onOpenSearch = { navController.navigate(WearRoutes.SEARCH) },
-                                    onOpenDownloads = { navController.navigate(WearRoutes.DOWNLOADS) },
-                                    onClearCache = appViewModel::clearTemporaryCache,
-                                    onSignOut = appViewModel::signOut,
-                                    onToast = appViewModel::showToast
-                                )
+                        val isMainRoute = (backStackEntryState.value?.destination?.route ?: WearRoutes.MAIN) == WearRoutes.MAIN
+                        val isPlayerVisible = isMainRoute && pagerState.currentPage == 0
+                        val isLyricsVisible = isMainRoute && (pagerState.currentPage == 1 || pagerState.targetPage == 1)
+
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            HorizontalPagerScaffold(
+                                pagerState = pagerState,
+                                modifier = Modifier.fillMaxSize(),
+                                pageIndicator = {
+                                    HorizontalPageIndicator(
+                                        pagerState = pagerState,
+                                        modifier = Modifier.padding(bottom = 4.dp)
+                                    )
+                                }
+                            ) { page ->
+                                when (page) {
+                                    0 -> PlayerScreen(
+                                        viewModel = playerViewModel,
+                                        isVisible = isPlayerVisible,
+                                        onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
+                                        onOpenArtist = openArtistFlow,
+                                        onToast = appViewModel::showToast
+                                    )
+                                    1 -> LyricsScreen(
+                                        viewModel = lyricsViewModel,
+                                        isVisible = isLyricsVisible
+                                    )
+                                    2 -> BrowseMenuScreen(
+                                        viewModel = browseViewModel,
+                                        onOpenRadio = { navController.navigate(WearRoutes.RADIO) },
+                                        onOpenQueue = { navController.navigate(WearRoutes.QUEUE) },
+                                        onOpenLibrarySongs = { navController.navigate(WearRoutes.LIBRARY_SONGS) },
+                                        onOpenPlaylists = { navController.navigate(WearRoutes.PLAYLISTS) },
+                                        onOpenSearch = { navController.navigate(WearRoutes.SEARCH) },
+                                        onOpenDownloads = { navController.navigate(WearRoutes.DOWNLOADS) },
+                                        onClearCache = appViewModel::clearTemporaryCache,
+                                        onSignOut = appViewModel::signOut,
+                                        onToast = appViewModel::showToast
+                                    )
+                                }
                             }
                         }
                     }
 
                     composable(WearRoutes.QUEUE) {
-                        QueueScreen(
-                            playerViewModel = playerViewModel,
-                            onClose = { navController.popBackStack() }
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            QueueScreen(
+                                playerViewModel = playerViewModel,
+                                onClose = { navController.popBackStack() }
+                            )
+                        }
                     }
 
                     composable(WearRoutes.RADIO) {
                         val radioVm: RadioViewModel = viewModel(factory = factory)
-                        RadioStationsScreen(
-                            viewModel = radioVm,
-                            onBack = { navController.popBackStack() },
-                            onStarted = returnToPlayer,
-                            onToast = appViewModel::showToast
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            RadioStationsScreen(
+                                viewModel = radioVm,
+                                onBack = { navController.popBackStack() },
+                                onStarted = returnToPlayer,
+                                onToast = appViewModel::showToast
+                            )
+                        }
                     }
 
                     composable(WearRoutes.LIBRARY_SONGS) {
-                        LibrarySongsScreen(
-                            browseViewModel = browseViewModel,
-                            onBack = { navController.popBackStack() },
-                            onPlaySong = { song ->
-                                container.playbackRepository.playSongs(listOf(song), 0)
-                                returnToPlayer()
-                            },
-                            onPlayQueue = { rows, idx ->
-                                container.playbackRepository.playSongRows(rows, idx)
-                                returnToPlayer()
-                            }
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            LibrarySongsScreen(
+                                browseViewModel = browseViewModel,
+                                onBack = { navController.popBackStack() },
+                                onPlaySong = { song ->
+                                    container.playbackRepository.playSongs(listOf(song), 0)
+                                    returnToPlayer()
+                                },
+                                onPlayQueue = { rows, idx ->
+                                    container.playbackRepository.playSongRows(rows, idx)
+                                    returnToPlayer()
+                                }
+                            )
+                        }
                     }
 
                     composable(WearRoutes.PLAYLISTS) {
-                        PlaylistsScreen(
-                            browseViewModel = browseViewModel,
-                            onBack = { navController.popBackStack() },
-                            onSelectPlaylist = { pl ->
-                                navController.navigate(WearRoutes.playlistDetail(pl.id))
-                            }
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            PlaylistsScreen(
+                                browseViewModel = browseViewModel,
+                                onBack = { navController.popBackStack() },
+                                onSelectPlaylist = { pl ->
+                                    navController.navigate(WearRoutes.playlistDetail(pl.id))
+                                }
+                            )
+                        }
                     }
 
                     composable(
@@ -216,11 +224,13 @@ fun WearAppRoot(
                             viewModelStoreOwner = entry,
                             factory = detailFactory
                         )
-                        PlaylistDetailScreen(
-                            viewModel = detailVm,
-                            onBack = { navController.popBackStack() },
-                            onPlayed = returnToPlayer
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            PlaylistDetailScreen(
+                                viewModel = detailVm,
+                                onBack = { navController.popBackStack() },
+                                onPlayed = returnToPlayer
+                            )
+                        }
                     }
 
                     composable(WearRoutes.SEARCH) { entry ->
@@ -228,12 +238,14 @@ fun WearAppRoot(
                             viewModelStoreOwner = entry,
                             factory = factory
                         )
-                        SearchScreen(
-                            viewModel = searchVm,
-                            onBack = { navController.popBackStack() },
-                            onPlayed = returnToPlayer,
-                            onToast = appViewModel::showToast
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            SearchScreen(
+                                viewModel = searchVm,
+                                onBack = { navController.popBackStack() },
+                                onPlayed = returnToPlayer,
+                                onToast = appViewModel::showToast
+                            )
+                        }
                     }
 
                     composable(WearRoutes.DOWNLOADS) { entry ->
@@ -241,12 +253,14 @@ fun WearAppRoot(
                             viewModelStoreOwner = entry,
                             factory = factory
                         )
-                        DownloadsScreen(
-                            viewModel = downloadsVm,
-                            onBack = { navController.popBackStack() },
-                            onPlayed = returnToPlayer,
-                            onToast = appViewModel::showToast
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            DownloadsScreen(
+                                viewModel = downloadsVm,
+                                onBack = { navController.popBackStack() },
+                                onPlayed = returnToPlayer,
+                                onToast = appViewModel::showToast
+                            )
+                        }
                     }
 
                     composable(
@@ -255,15 +269,17 @@ fun WearAppRoot(
                     ) { entry ->
                         val encoded = entry.arguments?.getString("rawArtists").orEmpty()
                         val rawArtists = remember(encoded) { Uri.decode(encoded) }
-                        ArtistPickerScreen(
-                            rawArtistString = rawArtists,
-                            onSelectArtist = { _, reorderedRaw ->
-                                navController.navigate(WearRoutes.artistDetail(reorderedRaw)) {
-                                    popUpTo(WearRoutes.MAIN) { inclusive = false }
-                                }
-                            },
-                            onDismiss = { navController.popBackStack() }
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            ArtistPickerScreen(
+                                rawArtistString = rawArtists,
+                                onSelectArtist = { _, reorderedRaw ->
+                                    navController.navigate(WearRoutes.artistDetail(reorderedRaw)) {
+                                        popUpTo(WearRoutes.MAIN) { inclusive = false }
+                                    }
+                                },
+                                onDismiss = { navController.popBackStack() }
+                            )
+                        }
                     }
 
                     composable(
@@ -279,20 +295,38 @@ fun WearAppRoot(
                             viewModelStoreOwner = entry,
                             factory = artistFactory
                         )
-                        ArtistDetailScreen(
-                            viewModel = artistVm,
-                            onClose = { navController.popBackStack() },
-                            onPlayed = returnToPlayer,
-                            onOpenSimilarArtist = { simName ->
-                                navController.navigate(WearRoutes.artistDetail(simName))
-                            },
-                            onToast = appViewModel::showToast
-                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            ArtistDetailScreen(
+                                viewModel = artistVm,
+                                onClose = { navController.popBackStack() },
+                                onPlayed = returnToPlayer,
+                                onOpenSimilarArtist = { simName ->
+                                    navController.navigate(WearRoutes.artistDetail(simName))
+                                },
+                                onToast = appViewModel::showToast
+                            )
+                        }
                     }
                 }
 
                 WearStatusToastOverlay(toastEvents = appViewModel.toastEvents)
             }
         }
+    }
+}
+
+@Composable
+private fun WearDestinationContainer(
+    artworkUrlFlow: StateFlow<String?>,
+    scrimAlpha: Float = 0f,
+    content: @Composable () -> Unit
+) {
+    val artworkUrl by artworkUrlFlow.collectAsStateWithLifecycle()
+    Box(modifier = Modifier.fillMaxSize()) {
+        HorologistArtworkBackground(
+            artworkUrl = artworkUrl,
+            scrimAlpha = scrimAlpha
+        )
+        content()
     }
 }
