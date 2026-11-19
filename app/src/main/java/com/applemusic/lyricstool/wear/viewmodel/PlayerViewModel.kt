@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 
 data class PlayerUiState(
     val currentSong: SongHit? = null,
+    val resolvedCatalogId: String = "",
     val isPlaying: Boolean = false,
     val isPreparing: Boolean = false,
     val preparingNote: String = "",
@@ -62,6 +63,7 @@ class PlayerViewModel(
 
         PlayerUiState(
             currentSong = song,
+            resolvedCatalogId = catId,
             isPlaying = snap.isPlaying,
             isPreparing = snap.preparing,
             preparingNote = snap.preparingNote,

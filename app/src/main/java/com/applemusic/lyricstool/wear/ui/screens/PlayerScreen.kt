@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
 import androidx.compose.foundation.layout.size
@@ -79,7 +78,7 @@ private fun Configuration.getScreenSizeInDpFromPercentage(percent: Float): Dp =
  * 严格保持 Google Horologist 播放器视觉布局：
  * - TopSection：跑马灯歌名 + 可点击进入歌手主页的强调色艺人名；
  * - MiddleSection：上一首 + 10-scallop 波浪形变进度播放/暂停按钮（长按进入定时播放）+ 下一首；
- * - BottomSection：缓冲状态 或 播放队列、离线下载进度与收藏快捷按钮；
+ * - BottomSection：定时倒计时胶囊（激活时位于播放按钮下方不重叠）+ 缓冲状态或播放队列、离线下载进度与收藏快捷按钮；
  * - 表冠旋转调节媒体音量 + 零多余重组的绘制期进度更新。
  */
 @Composable
@@ -87,30 +86,45 @@ fun PlayerScreen(
     viewModel: PlayerViewModel,
     isVisible: Boolean,
     onOpenQueue: () -> Unit,
-    onOpenArtist: (String) -> Unit,
+    onOpenArtist: (rawArtist: String, songId: String, catalogId: String) -> Unit,
     onOpenSleepTimer: () -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val configuration = LocalConfiguration.current
     val context = LocalContext.current
+    val hasSleepTimer = state.sleepTimerEndElapsedMs != null
 
     val middleSectionMinimumHeight = remember(configuration) {
         if (configuration.isLargeScreen) 84.dp else 78.dp
     }
-    val topSectionTopPadding = remember(configuration) {
-        configuration.getScreenSizeInDpFromPercentage(
-            if (configuration.isLargeScreen) 10f else 8f
-        )
+    val topSectionTopPadding = remember(configuration, hasSleepTimer) {
+        if (hasSleepTimer && !configuration.isLargeScreen) {
+            12.dp
+        } else {
+            configuration.getScreenSizeInDpFromPercentage(
+                if (configuration.isLargeScreen) 10f else 8f
+            )
+        }
     }
-    val topSectionBottomPadding = remember(configuration) {
-        if (configuration.isLargeScreen) 8.dp else 6.dp
+    val topSectionBottomPadding = remember(configuration, hasSleepTimer) {
+        if (hasSleepTimer && !configuration.isLargeScreen) {
+            3.dp
+        } else if (configuration.isLargeScreen) {
+            8.dp
+        } else {
+            6.dp
+        }
     }
     val middleSectionHeight = remember(configuration) {
         max(middleSectionMinimumHeight, configuration.screenHeightDp.dp * 0.36f)
     }
-    val topSectionHeight = remember(configuration) {
-        max(66.dp, (configuration.screenHeightDp.dp - middleSectionHeight) / 2f)
+    val topSectionHeight = remember(configuration, hasSleepTimer) {
+        if (hasSleepTimer && !configuration.isLargeScreen) {
+            54.dp
+        } else {
+            max(66.dp, (configuration.screenHeightDp.dp - middleSectionHeight) / 2f)
+        }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -227,7 +241,9 @@ fun PlayerScreen(
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(6.dp))
-                                    .clickable { onOpenArtist(artist) }
+                                    .clickable {
+                                        onOpenArtist(artist, song.id, state.resolvedCatalogId)
+                                    }
                                     .padding(horizontal = 6.dp, vertical = 1.dp)
                                     .basicMarquee(iterations = Int.MAX_VALUE, velocity = 24.dp)
                             )
@@ -300,28 +316,40 @@ fun PlayerScreen(
                             )
                         }
                     }
+                }
 
+                // Bottom Section (Sleep Timer Badge + Preparing note / Queue, Download & Favorite)
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(
+                            top = if (hasSleepTimer) {
+                                if (configuration.isLargeScreen) 2.dp else 3.dp
+                            } else {
+                                0.dp
+                            },
+                            bottom = if (hasSleepTimer) 9.dp else 6.dp
+                        ),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = if (hasSleepTimer) {
+                        Arrangement.spacedBy(
+                            if (configuration.isLargeScreen) 4.dp else 3.dp,
+                            Alignment.CenterVertically
+                        )
+                    } else {
+                        Arrangement.Center
+                    }
+                ) {
                     state.sleepTimerEndElapsedMs?.let { endElapsedMs ->
                         SleepTimerBadge(
                             endElapsedRealtimeMs = endElapsedMs,
                             isVisible = isVisible,
                             isAppResumed = isAppResumed,
-                            onClick = onOpenSleepTimer,
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .offset(y = 2.dp)
+                            onClick = onOpenSleepTimer
                         )
                     }
-                }
 
-                // Bottom Section (Preparing note / Queue, Download & Favorite)
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(bottom = 6.dp),
-                    contentAlignment = Alignment.Center
-                ) {
                     val showNote = state.isPreparing ||
                         (!state.isPlaying && state.preparingNote.isNotBlank())
                     if (showNote) {
@@ -340,13 +368,30 @@ fun PlayerScreen(
                         )
                     } else {
                         val activeDownload = state.activeDownload
+                        val bottomButtonSize = when {
+                            !hasSleepTimer -> 40.dp
+                            configuration.isLargeScreen -> 36.dp
+                            else -> 30.dp
+                        }
+                        val bottomIconSize = when {
+                            !hasSleepTimer -> 20.dp
+                            configuration.isLargeScreen -> 18.dp
+                            else -> 16.dp
+                        }
+                        val bottomSpacing = if (hasSleepTimer && !configuration.isLargeScreen) 8.dp else 10.dp
+                        val downloadRingSize = (bottomButtonSize - 6.dp).coerceAtLeast(24.dp)
+                        val downloadFontSize = when {
+                            !hasSleepTimer -> 9.sp
+                            configuration.isLargeScreen -> 8.sp
+                            else -> 7.5.sp
+                        }
                         Row(
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(bottomSpacing),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             FilledTonalIconButton(
                                 onClick = onOpenQueue,
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(bottomButtonSize),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = MaterialTheme.colorScheme.surfaceContainer,
                                     contentColor = MaterialTheme.colorScheme.onSurface
@@ -355,13 +400,13 @@ fun PlayerScreen(
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_baseline_queue_music_24),
                                     contentDescription = "播放列表",
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(bottomIconSize)
                                 )
                             }
                             FilledTonalIconButton(
                                 onClick = viewModel::downloadCurrentSong,
                                 enabled = state.currentSong != null,
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(bottomButtonSize),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = if (state.isDownloaded && activeDownload == null) {
                                         MaterialTheme.colorScheme.primaryContainer
@@ -383,7 +428,7 @@ fun PlayerScreen(
                                     ) {
                                         CircularProgressIndicator(
                                             progress = { (percent / 100f).coerceIn(0.05f, 1f) },
-                                            modifier = Modifier.size(34.dp),
+                                            modifier = Modifier.size(downloadRingSize),
                                             strokeWidth = 2.5.dp,
                                             colors = ProgressIndicatorDefaults.colors(
                                                 indicatorColor = MaterialTheme.colorScheme.primary
@@ -392,7 +437,7 @@ fun PlayerScreen(
                                         Text(
                                             text = if (percent >= 100) "100" else "$percent%",
                                             style = MaterialTheme.typography.labelSmall.copy(
-                                                fontSize = 9.sp,
+                                                fontSize = downloadFontSize,
                                                 fontWeight = FontWeight.Bold
                                             ),
                                             color = MaterialTheme.colorScheme.primary
@@ -406,14 +451,14 @@ fun PlayerScreen(
                                             HorologistIcons.Download
                                         },
                                         contentDescription = if (state.isDownloaded) "已下载" else "下载当前歌曲",
-                                        modifier = Modifier.size(20.dp)
+                                        modifier = Modifier.size(bottomIconSize)
                                     )
                                 }
                             }
                             FilledTonalIconButton(
                                 onClick = { viewModel.toggleFavorite(onToast) },
                                 enabled = !state.favoritePending && state.currentSong != null,
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(bottomButtonSize),
                                 colors = IconButtonDefaults.filledTonalIconButtonColors(
                                     containerColor = if (state.isFavorited) {
                                         MaterialTheme.colorScheme.primaryContainer
@@ -429,7 +474,7 @@ fun PlayerScreen(
                             ) {
                                 if (state.favoritePending) {
                                     CircularProgressIndicator(
-                                        modifier = Modifier.size(20.dp),
+                                        modifier = Modifier.size(bottomIconSize),
                                         strokeWidth = 2.dp,
                                         colors = ProgressIndicatorDefaults.colors(
                                             indicatorColor = MaterialTheme.colorScheme.primary
@@ -448,7 +493,7 @@ fun PlayerScreen(
                                         } else {
                                             MaterialTheme.colorScheme.onSurface
                                         },
-                                        modifier = Modifier.size(20.dp)
+                                        modifier = Modifier.size(bottomIconSize)
                                     )
                                 }
                             }
@@ -494,7 +539,7 @@ private fun SleepTimerBadge(
                 shape = badgeShape
             )
             .clickable(onClick = onClick)
-            .padding(horizontal = 7.dp, vertical = 2.dp),
+            .padding(horizontal = 7.dp, vertical = 1.5.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

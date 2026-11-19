@@ -102,34 +102,122 @@ class ArtistRepository {
 
     suspend fun loadArtist(
         artistName: String,
-        preferredArtistId: String = ""
+        preferredArtistId: String = "",
+        sourceSongId: String = "",
+        sourceCatalogId: String = ""
     ): ArtistLoadResult = withContext(Dispatchers.IO) {
         val localSongs = MusicRepository.songsOfArtist(artistName)
         val api = MusicRepository.api
+        val cleanArtistName = artistName.trim()
 
-        var resolvedId = preferredArtistId.trim()
-
-        if (resolvedId.isBlank()) {
-            resolvedId = localSongs.firstOrNull { it.artistId.isNotBlank() }?.artistId.orEmpty()
+        fun isSingleArtistMatch(rowArtist: String): Boolean {
+            val parts = ArtistNameParser.splitArtists(rowArtist)
+            return parts.size == 1 && ArtistAliasTable.matchesArtistName(parts.first(), cleanArtistName)
         }
 
-        if (resolvedId.isBlank()) {
-            val anyCatalogId = localSongs.firstOrNull { it.catalogId.isNotBlank() }?.catalogId.orEmpty()
-            if (anyCatalogId.isNotBlank()) {
-                resolvedId = api.getCatalogSongArtistId(anyCatalogId)
-            }
-        }
-
-        if (resolvedId.isBlank()) {
-            val searchArtists = api.searchArtistsOnly(artistName, 5)
-            val exact = api.resolveExactArtists(artistName, searchArtists, maxResults = 1)
-            resolvedId = exact.firstOrNull()?.id.orEmpty().ifBlank {
-                searchArtists.firstOrNull {
-                    ArtistAliasTable.matchesArtistName(it.name, artistName)
-                }?.id.orEmpty().ifBlank {
-                    searchArtists.firstOrNull()?.id.orEmpty()
+        fun pickMatchingCatalogArtistId(
+            songArtists: List<com.applemusic.android.apple.AppleArtist>,
+            targetName: String
+        ): String {
+            val valid = songArtists.filter { api.isCatalogArtistId(it.id) }
+            if (valid.isEmpty()) return ""
+            if (valid.size == 1) {
+                val only = valid.first()
+                if (targetName.isBlank() ||
+                    ArtistAliasTable.matchesArtistName(only.name, targetName) ||
+                    ArtistNameParser.splitArtists(targetName).size == 1
+                ) {
+                    return only.id
                 }
             }
+            valid.firstOrNull { ArtistAliasTable.matchesArtistName(it.name, targetName) }?.let {
+                return it.id
+            }
+            // 多艺人合作曲目可能存在中英区服名差异，批量核验中/美/日三区官方名匹配所选艺人
+            val ids = valid.map { it.id }.distinct()
+            val probes = listOf("cn" to "zh-Hans-CN", "us" to "en-US", "jp" to "ja-JP")
+            for ((probeSf, probeLang) in probes) {
+                val localized = api.getCatalogArtistsByIds(ids, lang = probeLang, targetStorefront = probeSf)
+                for (id in ids) {
+                    val locName = localized[id]?.name.orEmpty()
+                    if (locName.isNotBlank() && ArtistAliasTable.matchesArtistName(locName, targetName)) {
+                        ArtistAliasTable.registerDynamicAliases(listOf(targetName, locName))
+                        return id
+                    }
+                }
+            }
+            return if (valid.size == 1) valid.first().id else ""
+        }
+
+        fun resolveArtistIdFromSong(songId: String, catalogId: String): String {
+            val cleanCat = catalogId.removePrefix("apple:").trim()
+            val cleanSong = songId.removePrefix("apple:").trim()
+            val resolvedCatalogSongId = when {
+                cleanCat.isNotBlank() && !cleanCat.startsWith("i.") -> cleanCat
+                cleanSong.isNotBlank() && !cleanSong.startsWith("i.") -> cleanSong
+                cleanSong.startsWith("i.") -> api.librarySongCatalogId(cleanSong)
+                else -> ""
+            }
+            if (resolvedCatalogSongId.isBlank()) return ""
+            val songArtists = api.getCatalogSongArtists(resolvedCatalogSongId)
+            return pickMatchingCatalogArtistId(songArtists, cleanArtistName)
+        }
+
+        var resolvedId = preferredArtistId.trim().takeIf { api.isCatalogArtistId(it) }.orEmpty()
+        var resolvedFromSearch = false
+
+        // 1) 优先从当前播放歌曲的目录关联艺人精确解析（解决非资料库曲目与跨语种艺人名问题）
+        if (resolvedId.isBlank() && (sourceCatalogId.isNotBlank() || sourceSongId.isNotBlank())) {
+            resolvedId = resolveArtistIdFromSong(sourceSongId, sourceCatalogId)
+        }
+
+        // 2) 检查本地资料库曲目中已有的纯数字目录艺人 ID（严格过滤旧缓存中的 r.xxx 资料库艺人 ID！）
+        if (resolvedId.isBlank()) {
+            val singleArtistSongs = localSongs.filter { isSingleArtistMatch(it.artist) }
+            resolvedId = singleArtistSongs
+                .firstOrNull { api.isCatalogArtistId(it.artistId) }
+                ?.artistId
+                .orEmpty()
+        }
+
+        // 3) 若本地曲目只有 catalogId / i.xxx，经由歌曲的目录 artists 关系反查真实数字目录艺人 ID
+        if (resolvedId.isBlank() && localSongs.isNotEmpty()) {
+            val candidateRow = localSongs.firstOrNull {
+                isSingleArtistMatch(it.artist) && it.catalogId.isNotBlank()
+            } ?: localSongs.firstOrNull {
+                isSingleArtistMatch(it.artist) && it.appleId.isNotBlank()
+            } ?: localSongs.firstOrNull { it.catalogId.isNotBlank() }
+            if (candidateRow != null) {
+                resolvedId = resolveArtistIdFromSong(candidateRow.appleId, candidateRow.catalogId)
+            }
+        }
+
+        // 4) 若旧资料库快照仅保存了 r.xxx 资料库艺人 ID，尝试通过 /v1/me/library/artists/{id}?include=catalog 换取目录 ID
+        if (resolvedId.isBlank() && localSongs.isNotEmpty()) {
+            val libArtistId = localSongs.firstOrNull {
+                isSingleArtistMatch(it.artist) && it.artistId.startsWith("r.")
+            }?.artistId.orEmpty()
+            if (libArtistId.isNotBlank()) {
+                resolvedId = api.libraryArtistCatalogId(libArtistId)
+            }
+        }
+
+        // 5) 动态跨区服多语言搜索精准解析目录艺人 ID（不依赖静态字典）
+        fun resolveViaDynamicSearch(): String {
+            val exact = api.resolveExactArtists(cleanArtistName, maxResults = 1)
+            val exactId = exact.firstOrNull { api.isCatalogArtistId(it.id) }?.id.orEmpty()
+            if (exactId.isNotBlank()) return exactId
+            val broad = api.searchArtistsOnly(cleanArtistName, 5)
+            return broad.firstOrNull {
+                api.isCatalogArtistId(it.id) && ArtistAliasTable.matchesArtistName(it.name, cleanArtistName)
+            }?.id.orEmpty().ifBlank {
+                broad.firstOrNull { api.isCatalogArtistId(it.id) }?.id.orEmpty()
+            }
+        }
+
+        if (resolvedId.isBlank()) {
+            resolvedId = resolveViaDynamicSearch()
+            resolvedFromSearch = true
         }
 
         if (resolvedId.isBlank()) {
@@ -160,6 +248,31 @@ class ArtistRepository {
                 localSongs = localSongs
             )
         } catch (e: Exception) {
+            // 若来源于歌曲/本地关系的 ID 失效，兜底用动态搜索重新解析一次目录艺人 ID
+            if (!resolvedFromSearch) {
+                val fallbackId = runCatching { resolveViaDynamicSearch() }.getOrDefault("")
+                if (api.isCatalogArtistId(fallbackId) && fallbackId != resolvedId) {
+                    val fallbackCached = synchronized(pageCache) { pageCache.get(fallbackId) }
+                    if (fallbackCached != null) {
+                        return@withContext ArtistLoadResult(
+                            resolvedArtistId = fallbackId,
+                            page = fallbackCached,
+                            localSongs = localSongs
+                        )
+                    }
+                    val retryPage = runCatching {
+                        api.getCatalogArtistPage(fallbackId, initialTopSongsLimit = 5)
+                    }.getOrNull()
+                    if (retryPage != null) {
+                        synchronized(pageCache) { pageCache.put(fallbackId, retryPage) }
+                        return@withContext ArtistLoadResult(
+                            resolvedArtistId = fallbackId,
+                            page = retryPage,
+                            localSongs = localSongs
+                        )
+                    }
+                }
+            }
             ArtistLoadResult(
                 resolvedArtistId = resolvedId,
                 page = null,

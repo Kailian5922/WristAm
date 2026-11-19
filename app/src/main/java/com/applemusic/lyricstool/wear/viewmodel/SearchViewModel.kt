@@ -2,6 +2,7 @@ package com.applemusic.lyricstool.wear.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.android.apple.AppleArtist
 import com.applemusic.android.apple.AppleSearchResult
 import com.applemusic.android.apple.ArtistAliasTable
@@ -35,10 +36,23 @@ data class SearchedArtist(
     val subtitle: String = "歌手"
 )
 
+data class SearchedAlbum(
+    val id: String,
+    val name: String,
+    val artistName: String,
+    val artistId: String = "",
+    val artworkUrl: String = "",
+    val year: Int = 0,
+    val trackCount: Int = 0,
+    val storefront: String = "",
+    val isLibrary: Boolean = false
+)
+
 data class SearchUiState(
     val query: String = "",
     val searchByLyrics: Boolean = false,
     val artists: List<SearchedArtist> = emptyList(),
+    val albums: List<SearchedAlbum> = emptyList(),
     val results: List<SongHit> = emptyList(),
     val searching: Boolean = false,
     val status: String = "",
@@ -56,6 +70,7 @@ class SearchViewModel(
         val query: String = "",
         val searchByLyrics: Boolean = false,
         val artists: List<SearchedArtist> = emptyList(),
+        val albums: List<SearchedAlbum> = emptyList(),
         val results: List<SongHit> = emptyList(),
         val searching: Boolean = false,
         val status: String = ""
@@ -63,6 +78,7 @@ class SearchViewModel(
 
     private data class CombinedSearchResult(
         val artists: List<SearchedArtist>,
+        val albums: List<SearchedAlbum>,
         val songs: List<SongHit>,
         val note: String
     )
@@ -78,6 +94,7 @@ class SearchViewModel(
             query = local.query,
             searchByLyrics = local.searchByLyrics,
             artists = local.artists,
+            albums = local.albums,
             results = local.results,
             searching = local.searching,
             status = local.status,
@@ -108,6 +125,7 @@ class SearchViewModel(
                     if (byLyrics) {
                         CombinedSearchResult(
                             artists = emptyList(),
+                            albums = emptyList(),
                             songs = searchByLyricsParallel(trimmed),
                             note = ""
                         )
@@ -116,15 +134,16 @@ class SearchViewModel(
                     }
                 }
                 val statusMsg = when {
-                    combined.artists.isEmpty() && combined.songs.isEmpty() ->
+                    combined.artists.isEmpty() && combined.albums.isEmpty() && combined.songs.isEmpty() ->
                         combined.note.ifBlank {
-                            if (byLyrics) "没有找到匹配歌曲" else "没有找到匹配歌手或歌曲"
+                            if (byLyrics) "没有找到匹配歌曲" else "没有找到匹配歌手、专辑或歌曲"
                         }
                     else -> combined.note
                 }
                 localState.update {
                     it.copy(
                         artists = combined.artists,
+                        albums = combined.albums,
                         results = combined.songs,
                         searching = false,
                         status = statusMsg
@@ -222,6 +241,12 @@ class SearchViewModel(
             localArtists = localExactArtists
         )
 
+        val mergedAlbums = mergeAlbums(
+            query = trimmed,
+            catalogAlbums = catalogResult?.albums.orEmpty(),
+            localAlbums = localResult.albums
+        )
+
         val mergedSongs = ArrayList<SongHit>()
         val seenIds = HashSet<String>()
         val seenSignatures = HashSet<String>()
@@ -245,18 +270,81 @@ class SearchViewModel(
         for (s in localResult.songs) addIfUnique(s.toSongHit())
         for (s in catalogResult?.songs.orEmpty()) addIfUnique(s.toSongHit())
 
+        val hasAnyMatch = mergedArtists.isNotEmpty() || mergedAlbums.isNotEmpty() || mergedSongs.isNotEmpty()
         val note = when {
-            catalogError != null && (mergedArtists.isNotEmpty() || mergedSongs.isNotEmpty()) ->
+            catalogError != null && hasAnyMatch ->
                 "网络异常，已展示本地资料库匹配"
-            catalogError != null && mergedArtists.isEmpty() && mergedSongs.isEmpty() ->
+            catalogError != null && !hasAnyMatch ->
                 throw catalogError
             else -> ""
         }
         return CombinedSearchResult(
             artists = mergedArtists,
+            albums = mergedAlbums,
             songs = mergedSongs,
             note = note
         )
+    }
+
+    private fun mergeAlbums(
+        query: String,
+        catalogAlbums: List<AppleAlbum>,
+        localAlbums: List<AppleAlbum>
+    ): List<SearchedAlbum> {
+        val candidates = ArrayList<SearchedAlbum>()
+        val seenIds = HashSet<String>()
+        val seenSignatures = HashSet<String>()
+
+        fun addAlbum(album: AppleAlbum) {
+            val cleanName = album.name.trim()
+            if (cleanName.isEmpty()) return
+            val cleanId = album.id.trim()
+            val cleanArtist = album.artistName.trim()
+            val sig = normalizeSignature(cleanName, cleanArtist)
+            if (cleanId.isNotEmpty() && cleanId in seenIds) return
+            if (sig in seenSignatures) return
+
+            if (cleanId.isNotEmpty()) seenIds.add(cleanId)
+            seenSignatures.add(sig)
+            candidates.add(
+                SearchedAlbum(
+                    id = cleanId,
+                    name = cleanName,
+                    artistName = cleanArtist,
+                    artistId = album.artistId.trim(),
+                    artworkUrl = album.artworkUrl.trim(),
+                    year = album.year,
+                    trackCount = album.trackCount,
+                    storefront = album.catalogStorefront.trim(),
+                    isLibrary = album.isLibrary || cleanId.isEmpty()
+                )
+            )
+        }
+
+        // 目录专辑优先，确保进入专辑页后能完整加载所有曲目
+        for (a in catalogAlbums) addAlbum(a)
+        for (a in localAlbums) addAlbum(a)
+
+        val normQuery = ArtistAliasTable.normalizeKey(query)
+        val ranked = candidates.withIndex().sortedWith(
+            compareBy<IndexedValue<SearchedAlbum>>(
+                { albumMatchRank(it.value, normQuery) },
+                { if (it.value.isLibrary) 1 else 0 },
+                { it.index }
+            )
+        )
+        return ranked.map { it.value }.take(MAX_ALBUMS)
+    }
+
+    private fun albumMatchRank(album: SearchedAlbum, normQuery: String): Int {
+        if (normQuery.isEmpty()) return 3
+        val normName = ArtistAliasTable.normalizeKey(album.name)
+        return when {
+            normName == normQuery -> 0
+            normName.startsWith(normQuery) -> 1
+            normName.contains(normQuery) -> 2
+            else -> 3
+        }
     }
 
     private fun mergeExactArtists(
@@ -327,5 +415,6 @@ class SearchViewModel(
 
     private companion object {
         const val MAX_EXACT_ARTISTS = 3
+        const val MAX_ALBUMS = 6
     }
 }
