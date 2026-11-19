@@ -2,7 +2,6 @@ package com.applemusic.lyricstool.wear.viewmodel
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.android.apple.AppleArtistPage
 import com.applemusic.android.apple.AppleLibrarySync
 import com.applemusic.android.apple.AppleSong
@@ -12,7 +11,6 @@ import com.applemusic.lyricstool.wear.data.ArtistNameParser
 import com.applemusic.lyricstool.wear.data.ArtistRepository
 import com.applemusic.lyricstool.wear.data.DownloadRepository
 import com.applemusic.lyricstool.wear.data.PlaybackRepository
-import com.applemusic.lyricstool.wear.data.toSongHit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,7 +30,6 @@ data class ArtistUiState(
     val localSongs: List<AppleLibrarySync.SongRow> = emptyList(),
     val hasMoreTopSongs: Boolean = false,
     val loadingMoreTopSongs: Boolean = false,
-    val loadingAlbumId: String? = null,
     val isLoading: Boolean = true,
     val errorMessage: String? = null,
     val cleanBio: String = "",
@@ -45,7 +42,9 @@ class ArtistViewModel(
     private val artistRepository: ArtistRepository,
     private val playbackRepository: PlaybackRepository,
     private val downloadRepository: DownloadRepository,
-    private val directArtistId: String = ""
+    private val directArtistId: String = "",
+    private val sourceSongId: String = "",
+    private val sourceCatalogId: String = ""
 ) : ViewModel() {
 
     private data class LocalArtistState(
@@ -57,7 +56,6 @@ class ArtistViewModel(
         val localSongs: List<AppleLibrarySync.SongRow> = emptyList(),
         val hasMoreTopSongs: Boolean = false,
         val loadingMoreTopSongs: Boolean = false,
-        val loadingAlbumId: String? = null,
         val isLoading: Boolean = true,
         val errorMessage: String? = null,
         val cleanBio: String = ""
@@ -72,7 +70,6 @@ class ArtistViewModel(
     }
     private var loadJob: Job? = null
     private var loadMoreJob: Job? = null
-    private var albumJob: Job? = null
     private var topSongsOffset: Int = 0
 
     private val localState = MutableStateFlow(
@@ -95,7 +92,6 @@ class ArtistViewModel(
             localSongs = local.localSongs,
             hasMoreTopSongs = local.hasMoreTopSongs,
             loadingMoreTopSongs = local.loadingMoreTopSongs,
-            loadingAlbumId = local.loadingAlbumId,
             isLoading = local.isLoading,
             errorMessage = local.errorMessage,
             cleanBio = local.cleanBio,
@@ -122,7 +118,6 @@ class ArtistViewModel(
     private fun loadArtist(artistName: String, preferredArtistId: String = "") {
         loadJob?.cancel()
         loadMoreJob?.cancel()
-        albumJob?.cancel()
         topSongsOffset = 0
 
         localState.update {
@@ -134,7 +129,6 @@ class ArtistViewModel(
                 localSongs = emptyList(),
                 hasMoreTopSongs = false,
                 loadingMoreTopSongs = false,
-                loadingAlbumId = null,
                 isLoading = true,
                 errorMessage = null,
                 cleanBio = ""
@@ -143,7 +137,12 @@ class ArtistViewModel(
 
         loadJob = viewModelScope.launch {
             try {
-                val res = artistRepository.loadArtist(artistName, preferredArtistId = preferredArtistId)
+                val res = artistRepository.loadArtist(
+                    artistName = artistName,
+                    preferredArtistId = preferredArtistId,
+                    sourceSongId = sourceSongId,
+                    sourceCatalogId = sourceCatalogId
+                )
                 val initialTop = res.page?.topSongs.orEmpty()
                 topSongsOffset = initialTop.size
                 localState.update {
@@ -221,38 +220,6 @@ class ArtistViewModel(
 
     fun downloadSong(song: SongHit) {
         downloadRepository.startDownload(song)
-    }
-
-    fun playAlbum(
-        album: AppleAlbum,
-        onPlayed: () -> Unit,
-        onToast: (String, Boolean) -> Unit
-    ) {
-        if (localState.value.loadingAlbumId != null) return
-        localState.update { it.copy(loadingAlbumId = album.id) }
-        albumJob?.cancel()
-        albumJob = viewModelScope.launch {
-            try {
-                val res = artistRepository.loadAlbumTracks(album)
-                res.fold(
-                    onSuccess = { tracks ->
-                        localState.update { it.copy(loadingAlbumId = null) }
-                        if (tracks.isEmpty()) {
-                            onToast("该专辑暂无可播放曲目", true)
-                        } else {
-                            playbackRepository.playSongs(tracks.map { it.toSongHit() }, 0)
-                            onPlayed()
-                        }
-                    },
-                    onFailure = { e ->
-                        localState.update { it.copy(loadingAlbumId = null) }
-                        onToast("加载专辑失败：${e.message ?: "网络超时"}", true)
-                    }
-                )
-            } catch (ce: CancellationException) {
-                throw ce
-            }
-        }
     }
 
     private companion object {

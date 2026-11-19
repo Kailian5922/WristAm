@@ -69,7 +69,9 @@ class PlaylistDetailViewModelFactory(
 class ArtistViewModelFactory(
     private val container: WearAppContainer,
     private val rawArtistParam: String,
-    private val directArtistId: String = ""
+    private val directArtistId: String = "",
+    private val sourceSongId: String = "",
+    private val sourceCatalogId: String = ""
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -79,7 +81,39 @@ class ArtistViewModelFactory(
                 artistRepository = container.artistRepository,
                 playbackRepository = container.playbackRepository,
                 downloadRepository = container.downloadRepository,
-                directArtistId = directArtistId
+                directArtistId = directArtistId,
+                sourceSongId = sourceSongId,
+                sourceCatalogId = sourceCatalogId
+            ) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
+    }
+}
+
+class AlbumDetailViewModelFactory(
+    private val container: WearAppContainer,
+    private val albumId: String,
+    private val storefront: String = "",
+    private val fallbackName: String = "",
+    private val fallbackArtist: String = "",
+    private val fallbackArtwork: String = "",
+    private val fallbackYear: Int = 0,
+    private val isLibrary: Boolean = false
+) : ViewModelProvider.Factory {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass == AlbumDetailViewModel::class.java) {
+            return AlbumDetailViewModel(
+                albumId = albumId,
+                storefront = storefront,
+                fallbackName = fallbackName,
+                fallbackArtist = fallbackArtist,
+                fallbackArtwork = fallbackArtwork,
+                fallbackYear = fallbackYear,
+                isLibrary = isLibrary,
+                albumRepository = container.albumRepository,
+                playbackRepository = container.playbackRepository,
+                downloadRepository = container.downloadRepository
             ) as T
         }
         throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")

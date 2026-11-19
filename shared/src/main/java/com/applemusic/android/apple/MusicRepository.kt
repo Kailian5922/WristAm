@@ -308,7 +308,11 @@ object MusicRepository {
         }
         val artistIdByName = HashMap<String, String>()
         for (s in songsSnap) {
-            if (s.artist.isNotBlank() && s.artistId.isNotBlank() && s.artist !in artistIdByName) {
+            if (s.artist.isNotBlank() &&
+                s.artistId.isNotBlank() &&
+                s.artistId.all { it in '0'..'9' } &&
+                s.artist !in artistIdByName
+            ) {
                 artistIdByName[s.artist] = s.artistId
             }
             if (s.title.lowercase(Locale.ROOT).contains(t) ||
@@ -328,6 +332,7 @@ object MusicRepository {
                     AppleAlbum(
                         name = a.name,
                         artistName = a.artist,
+                        artistId = artistIdByName[a.artist].orEmpty(),
                         artworkUrl = a.coverUrl,
                         trackCount = a.trackCount,
                         year = a.year,
@@ -398,7 +403,14 @@ object MusicRepository {
     }
 
     fun songsOfAlbum(name: String, artist: String): List<AppleLibrarySync.SongRow> {
-        return albumList.firstOrNull { it.name == name && it.artist == artist }?.songs?.toList() ?: emptyList()
+        val exact = albumList.firstOrNull { it.name == name && it.artist == artist }?.songs?.toList()
+        if (!exact.isNullOrEmpty()) return exact
+        val cleanName = name.trim()
+        val cleanArtist = artist.trim()
+        return albumList.firstOrNull {
+            it.name.equals(cleanName, ignoreCase = true) &&
+                (cleanArtist.isBlank() || it.artist.equals(cleanArtist, ignoreCase = true))
+        }?.songs?.toList() ?: emptyList()
     }
 
     /** 查找资料库中该艺人的曲目（同时匹配单艺人、双语别名及合作曲目）。 */

@@ -80,6 +80,11 @@ data class AppleArtistPage(
     val similarArtists: List<AppleArtist> = emptyList()
 )
 
+data class AppleAlbumDetail(
+    val album: AppleAlbum,
+    val tracks: List<AppleSong> = emptyList()
+)
+
 data class ApplePlaylist(
     var id: String = "",
     var name: String = "",

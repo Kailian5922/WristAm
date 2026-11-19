@@ -1,5 +1,6 @@
 package com.applemusic.lyricstool.wear.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,6 +17,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -44,6 +47,7 @@ import androidx.wear.compose.material3.ProgressIndicatorDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import coil.compose.AsyncImage
+import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.lyricstool.wear.data.containsSong
 import com.applemusic.lyricstool.wear.data.findFor
 import com.applemusic.lyricstool.wear.data.toSongHit
@@ -58,6 +62,7 @@ fun ArtistDetailScreen(
     viewModel: ArtistViewModel,
     onClose: () -> Unit,
     onPlayed: () -> Unit,
+    onOpenAlbum: (AppleAlbum) -> Unit,
     onOpenSimilarArtist: (String, String) -> Unit,
     onToast: (String, Boolean) -> Unit
 ) {
@@ -379,8 +384,10 @@ fun ArtistDetailScreen(
                 }
             }
 
-            // 精选专辑
+            // 精选专辑（点击打开专辑详情页，而非直接播放）
             val albums = state.artistPage?.albums.orEmpty()
+            val fallbackArtistName = state.artistPage?.artist?.name?.ifBlank { state.currentArtist }
+                ?: state.currentArtist
             if (albums.isNotEmpty()) {
                 item(key = "artist_albums_hdr") {
                     ListHeader(modifier = Modifier.fillMaxWidth()) {
@@ -389,12 +396,17 @@ fun ArtistDetailScreen(
                 }
                 itemsIndexed(
                     items = albums.take(10),
-                    key = { _, album -> "album_${album.id}" }
+                    key = { index, album -> "album_${album.id}_$index" }
                 ) { _, album ->
-                    val isLoadingAlbum = state.loadingAlbumId == album.id
                     Card(
-                        onClick = { viewModel.playAlbum(album, onPlayed, onToast) },
-                        enabled = state.loadingAlbumId == null,
+                        onClick = {
+                            onOpenAlbum(
+                                album.copy(
+                                    artistName = album.artistName.ifBlank { fallbackArtistName },
+                                    artistId = album.artistId.ifBlank { state.resolvedArtistId }
+                                )
+                            )
+                        },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 2.dp)
@@ -405,17 +417,29 @@ fun ArtistDetailScreen(
                                 .padding(8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (album.artworkUrl.isNotBlank()) {
-                                AsyncImage(
-                                    model = album.artworkUrl,
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Album,
                                     contentDescription = null,
-                                    modifier = Modifier
-                                        .size(36.dp)
-                                        .clip(RoundedCornerShape(6.dp)),
-                                    contentScale = ContentScale.Crop
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
                                 )
-                                Spacer(modifier = Modifier.width(8.dp))
+                                if (album.artworkUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = album.artworkUrl,
+                                        contentDescription = album.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
                             }
+                            Spacer(modifier = Modifier.width(8.dp))
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = album.name,
@@ -436,16 +460,99 @@ fun ArtistDetailScreen(
                                     )
                                 }
                             }
-                            if (isLoadingAlbum) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    strokeWidth = 2.dp,
-                                    colors = ProgressIndicatorDefaults.colors(
-                                        indicatorColor = MaterialTheme.colorScheme.primary
-                                    )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "打开专辑",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 单曲与 EP（点击同样打开专辑详情页）
+            val singles = state.artistPage?.singles.orEmpty()
+            if (singles.isNotEmpty()) {
+                item(key = "artist_singles_hdr") {
+                    ListHeader(modifier = Modifier.fillMaxWidth()) {
+                        Text("单曲与 EP (${singles.size})", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+                itemsIndexed(
+                    items = singles.take(8),
+                    key = { index, single -> "single_${single.id}_$index" }
+                ) { _, single ->
+                    Card(
+                        onClick = {
+                            onOpenAlbum(
+                                single.copy(
+                                    artistName = single.artistName.ifBlank { fallbackArtistName },
+                                    artistId = single.artistId.ifBlank { state.resolvedArtistId }
                                 )
+                            )
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Album,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                if (single.artworkUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = single.artworkUrl,
+                                        contentDescription = single.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
                             }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = single.name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val yearStr = if (single.year > 0) "${single.year}年" else ""
+                                val trackStr = if (single.trackCount > 0) " · ${single.trackCount}首" else ""
+                                val sub = "$yearStr$trackStr".trimStart(' ', '·')
+                                if (sub.isNotBlank()) {
+                                    Text(
+                                        text = sub,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "打开专辑",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     }
                 }

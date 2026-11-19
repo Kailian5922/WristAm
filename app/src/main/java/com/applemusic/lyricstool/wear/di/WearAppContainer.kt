@@ -9,6 +9,7 @@ import com.applemusic.lyricstool.data.QQMusicLyricsClient
 import com.applemusic.lyricstool.wear.EncryptedTokenStore
 import com.applemusic.lyricstool.wear.WearAppleApiTokenStore
 import com.applemusic.lyricstool.wear.WearMusicService
+import com.applemusic.lyricstool.wear.data.AlbumRepository
 import com.applemusic.lyricstool.wear.data.ArtistRepository
 import com.applemusic.lyricstool.wear.data.AuthRepository
 import com.applemusic.lyricstool.wear.data.DownloadRepository
@@ -83,4 +84,5 @@ class WearAppContainer(context: Context) {
     val libraryRepository: LibraryRepository = LibraryRepository()
     val radioRepository: RadioRepository = RadioRepository(appContext)
     val artistRepository: ArtistRepository = ArtistRepository()
+    val albumRepository: AlbumRepository = AlbumRepository()
 }

@@ -26,6 +26,7 @@ import androidx.wear.compose.navigation.rememberSwipeDismissableNavController
 import com.applemusic.lyricstool.wear.data.ArtistNameParser
 import com.applemusic.lyricstool.wear.di.WearAppContainer
 import com.applemusic.lyricstool.wear.ui.components.WearStatusToastOverlay
+import com.applemusic.lyricstool.wear.ui.screens.AlbumDetailScreen
 import com.applemusic.lyricstool.wear.ui.screens.ArtistDetailScreen
 import com.applemusic.lyricstool.wear.ui.screens.ArtistPickerScreen
 import com.applemusic.lyricstool.wear.ui.screens.AuthSetupScreen
@@ -43,6 +44,8 @@ import com.applemusic.lyricstool.wear.ui.screens.SleepTimerScreen
 import com.applemusic.lyricstool.wear.ui.theme.HorologistArtworkBackground
 import com.applemusic.lyricstool.wear.ui.theme.HorologistColors
 import com.applemusic.lyricstool.wear.ui.theme.rememberDynamicColorScheme
+import com.applemusic.lyricstool.wear.viewmodel.AlbumDetailViewModel
+import com.applemusic.lyricstool.wear.viewmodel.AlbumDetailViewModelFactory
 import com.applemusic.lyricstool.wear.viewmodel.AppViewModel
 import com.applemusic.lyricstool.wear.viewmodel.ArtistViewModel
 import com.applemusic.lyricstool.wear.viewmodel.ArtistViewModelFactory
@@ -97,12 +100,24 @@ fun WearAppRoot(
         scope.launch { pagerState.animateScrollToPage(0) }
     }
 
-    val openArtistFlow: (String) -> Unit = { rawArtist ->
+    val openArtistFlow: (String, String, String) -> Unit = { rawArtist, songId, catalogId ->
         val split = ArtistNameParser.splitArtists(rawArtist)
         if (split.size > 1) {
-            navController.navigate(WearRoutes.artistPicker(rawArtist))
+            navController.navigate(
+                WearRoutes.artistPicker(
+                    rawArtists = rawArtist,
+                    songId = songId,
+                    catalogId = catalogId
+                )
+            )
         } else {
-            navController.navigate(WearRoutes.artistDetail(split.firstOrNull() ?: rawArtist))
+            navController.navigate(
+                WearRoutes.artistDetail(
+                    rawArtists = split.firstOrNull() ?: rawArtist,
+                    songId = songId,
+                    catalogId = catalogId
+                )
+            )
         }
     }
 
@@ -255,6 +270,19 @@ fun WearAppRoot(
                                 onPlayed = returnToPlayer,
                                 onOpenArtist = { artistName, artistId ->
                                     navController.navigate(WearRoutes.artistDetail(artistName, artistId))
+                                },
+                                onOpenAlbum = { album ->
+                                    navController.navigate(
+                                        WearRoutes.albumDetail(
+                                            albumId = album.id,
+                                            name = album.name,
+                                            artist = album.artistName,
+                                            artwork = album.artworkUrl,
+                                            storefront = album.storefront,
+                                            year = album.year,
+                                            isLibrary = album.isLibrary
+                                        )
+                                    )
                                 }
                             )
                         }
@@ -277,16 +305,36 @@ fun WearAppRoot(
 
                     composable(
                         route = WearRoutes.ARTIST_PICKER_PATTERN,
-                        arguments = listOf(navArgument("rawArtists") { type = NavType.StringType })
+                        arguments = listOf(
+                            navArgument("rawArtists") { type = NavType.StringType },
+                            navArgument("songId") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("catalogId") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            }
+                        )
                     ) { entry ->
                         val encoded = entry.arguments?.getString("rawArtists").orEmpty()
                         val rawArtists = remember(encoded) { Uri.decode(encoded) }
+                        val encodedSongId = entry.arguments?.getString("songId").orEmpty()
+                        val songId = remember(encodedSongId) { Uri.decode(encodedSongId) }
+                        val encodedCatalogId = entry.arguments?.getString("catalogId").orEmpty()
+                        val catalogId = remember(encodedCatalogId) { Uri.decode(encodedCatalogId) }
                         WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
                             ArtistPickerScreen(
                                 rawArtistString = rawArtists,
                                 onSelectArtist = { _, reorderedRaw ->
-                                    navController.navigate(WearRoutes.artistDetail(reorderedRaw)) {
-                                        popUpTo(WearRoutes.MAIN) { inclusive = false }
+                                    navController.navigate(
+                                        WearRoutes.artistDetail(
+                                            rawArtists = reorderedRaw,
+                                            songId = songId,
+                                            catalogId = catalogId
+                                        )
+                                    ) {
+                                        popUpTo(WearRoutes.ARTIST_PICKER_PATTERN) { inclusive = true }
                                     }
                                 },
                                 onDismiss = { navController.popBackStack() }
@@ -301,6 +349,14 @@ fun WearAppRoot(
                             navArgument("artistId") {
                                 type = NavType.StringType
                                 defaultValue = ""
+                            },
+                            navArgument("songId") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("catalogId") {
+                                type = NavType.StringType
+                                defaultValue = ""
                             }
                         )
                     ) { entry ->
@@ -308,8 +364,24 @@ fun WearAppRoot(
                         val rawArtists = remember(encoded) { Uri.decode(encoded) }
                         val encodedArtistId = entry.arguments?.getString("artistId").orEmpty()
                         val directArtistId = remember(encodedArtistId) { Uri.decode(encodedArtistId) }
-                        val artistFactory = remember(container, rawArtists, directArtistId) {
-                            ArtistViewModelFactory(container, rawArtists, directArtistId)
+                        val encodedSongId = entry.arguments?.getString("songId").orEmpty()
+                        val sourceSongId = remember(encodedSongId) { Uri.decode(encodedSongId) }
+                        val encodedCatalogId = entry.arguments?.getString("catalogId").orEmpty()
+                        val sourceCatalogId = remember(encodedCatalogId) { Uri.decode(encodedCatalogId) }
+                        val artistFactory = remember(
+                            container,
+                            rawArtists,
+                            directArtistId,
+                            sourceSongId,
+                            sourceCatalogId
+                        ) {
+                            ArtistViewModelFactory(
+                                container = container,
+                                rawArtistParam = rawArtists,
+                                directArtistId = directArtistId,
+                                sourceSongId = sourceSongId,
+                                sourceCatalogId = sourceCatalogId
+                            )
                         }
                         val artistVm: ArtistViewModel = viewModel(
                             viewModelStoreOwner = entry,
@@ -320,10 +392,119 @@ fun WearAppRoot(
                                 viewModel = artistVm,
                                 onClose = { navController.popBackStack() },
                                 onPlayed = returnToPlayer,
+                                onOpenAlbum = { album ->
+                                    navController.navigate(
+                                        WearRoutes.albumDetail(
+                                            albumId = album.id,
+                                            name = album.name,
+                                            artist = album.artistName,
+                                            artwork = album.artworkUrl,
+                                            storefront = album.catalogStorefront,
+                                            year = album.year,
+                                            isLibrary = album.isLibrary
+                                        )
+                                    )
+                                },
                                 onOpenSimilarArtist = { simName, simId ->
                                     navController.navigate(WearRoutes.artistDetail(simName, simId))
                                 },
                                 onToast = appViewModel::showToast
+                            )
+                        }
+                    }
+
+                    composable(
+                        route = WearRoutes.ALBUM_DETAIL_PATTERN,
+                        arguments = listOf(
+                            navArgument("albumId") { type = NavType.StringType },
+                            navArgument("name") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("artist") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("artwork") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("storefront") {
+                                type = NavType.StringType
+                                defaultValue = ""
+                            },
+                            navArgument("year") {
+                                type = NavType.IntType
+                                defaultValue = 0
+                            },
+                            navArgument("isLibrary") {
+                                type = NavType.BoolType
+                                defaultValue = false
+                            }
+                        )
+                    ) { entry ->
+                        val rawAlbumId = entry.arguments?.getString("albumId").orEmpty()
+                        val albumId = remember(rawAlbumId) { Uri.decode(rawAlbumId) }
+                        val rawName = entry.arguments?.getString("name").orEmpty()
+                        val rawArtist = entry.arguments?.getString("artist").orEmpty()
+                        val rawArtwork = entry.arguments?.getString("artwork").orEmpty()
+                        val artwork = remember(rawArtwork) {
+                            if (rawArtwork.startsWith("http%3A", ignoreCase = true) ||
+                                rawArtwork.startsWith("https%3A", ignoreCase = true)
+                            ) {
+                                Uri.decode(rawArtwork)
+                            } else {
+                                rawArtwork
+                            }
+                        }
+                        val storefront = entry.arguments?.getString("storefront").orEmpty()
+                        val year = entry.arguments?.getInt("year") ?: 0
+                        val isLibrary = entry.arguments?.getBoolean("isLibrary") ?: false
+
+                        val albumFactory = remember(
+                            container,
+                            albumId,
+                            storefront,
+                            rawName,
+                            rawArtist,
+                            artwork,
+                            year,
+                            isLibrary
+                        ) {
+                            AlbumDetailViewModelFactory(
+                                container = container,
+                                albumId = albumId,
+                                storefront = storefront,
+                                fallbackName = rawName,
+                                fallbackArtist = rawArtist,
+                                fallbackArtwork = artwork,
+                                fallbackYear = year,
+                                isLibrary = isLibrary
+                            )
+                        }
+                        val albumVm: AlbumDetailViewModel = viewModel(
+                            viewModelStoreOwner = entry,
+                            factory = albumFactory
+                        )
+                        WearDestinationContainer(artworkUrlFlow = appViewModel.currentArtworkUrl) {
+                            AlbumDetailScreen(
+                                viewModel = albumVm,
+                                onBack = { navController.popBackStack() },
+                                onPlayed = returnToPlayer,
+                                onOpenArtist = { artistName, artistId, songId, catalogId ->
+                                    if (artistId.isNotBlank()) {
+                                        navController.navigate(
+                                            WearRoutes.artistDetail(
+                                                rawArtists = artistName,
+                                                artistId = artistId,
+                                                songId = songId,
+                                                catalogId = catalogId
+                                            )
+                                        )
+                                    } else {
+                                        openArtistFlow(artistName, songId, catalogId)
+                                    }
+                                }
                             )
                         }
                     }

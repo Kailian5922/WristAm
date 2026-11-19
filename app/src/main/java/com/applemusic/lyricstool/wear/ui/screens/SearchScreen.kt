@@ -12,10 +12,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.OutlinedTextField
@@ -52,13 +54,15 @@ import com.applemusic.lyricstool.wear.ui.components.SongDownloadActionButton
 import com.applemusic.lyricstool.wear.ui.components.WearBackHeader
 import com.applemusic.lyricstool.wear.ui.components.WearDownloadLinearProgressBar
 import com.applemusic.lyricstool.wear.viewmodel.SearchViewModel
+import com.applemusic.lyricstool.wear.viewmodel.SearchedAlbum
 
 @Composable
 fun SearchScreen(
     viewModel: SearchViewModel,
     onBack: () -> Unit,
     onPlayed: () -> Unit,
-    onOpenArtist: (artistName: String, artistId: String) -> Unit
+    onOpenArtist: (artistName: String, artistId: String) -> Unit,
+    onOpenAlbum: (SearchedAlbum) -> Unit
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val listState = rememberTransformingLazyColumnState()
@@ -80,7 +84,7 @@ fun SearchScreen(
                     value = state.query,
                     onValueChange = viewModel::onQueryChanged,
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text(if (state.searchByLyrics) "输入歌词片段" else "输入歌名/歌手") },
+                    label = { Text(if (state.searchByLyrics) "输入歌词片段" else "歌名/歌手/专辑") },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                     keyboardActions = KeyboardActions(onSearch = { viewModel.performSearch() }),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -211,7 +215,88 @@ fun SearchScreen(
                 }
             }
 
-            if (state.results.isNotEmpty() && !state.searchByLyrics && state.artists.isNotEmpty()) {
+            if (!state.searchByLyrics && state.albums.isNotEmpty()) {
+                item(key = "search_albums_header") {
+                    ListHeader(modifier = Modifier.fillMaxWidth()) {
+                        Text("专辑", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+
+                itemsIndexed(
+                    items = state.albums,
+                    key = { index, album -> "album_${album.id}_${album.name}_$index" }
+                ) { _, album ->
+                    Card(
+                        onClick = { onOpenAlbum(album) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Album,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                if (album.artworkUrl.isNotBlank()) {
+                                    AsyncImage(
+                                        model = album.artworkUrl,
+                                        contentDescription = album.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = album.name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val yearPart = if (album.year > 0) "${album.year}年" else ""
+                                val subtitle = listOf(album.artistName, yearPart)
+                                    .filter(String::isNotBlank)
+                                    .joinToString(" · ")
+                                    .ifBlank { "专辑" }
+                                Text(
+                                    text = subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                contentDescription = "打开专辑",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (state.results.isNotEmpty() && !state.searchByLyrics &&
+                (state.artists.isNotEmpty() || state.albums.isNotEmpty())
+            ) {
                 item(key = "search_songs_header") {
                     ListHeader(modifier = Modifier.fillMaxWidth()) {
                         Text("歌曲", style = MaterialTheme.typography.labelMedium)
