@@ -9,7 +9,9 @@ import com.applemusic.android.util.ChineseText
 import com.applemusic.lyricstool.data.qq.DESHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -17,8 +19,16 @@ import java.io.EOFException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
+import java.util.Locale
+import java.util.UUID
 import java.util.zip.InflaterInputStream
 import kotlin.math.abs
+
+data class LyricSearchCandidate(
+    val song: SongHit,
+    val lyricSnippet: String = ""
+)
 
 class QQMusicLyricsClient {
     private data class SearchMetadata(
@@ -28,55 +38,482 @@ class QQMusicLyricsClient {
     )
 
     suspend fun searchSongs(term: String): List<SongHit> = withContext(Dispatchers.IO) {
-        parseSongSearch(requestSearch(term, searchType = 0))
+        val clean = term.trim()
+        if (clean.isEmpty()) return@withContext emptyList()
+
+        var firstError: Exception? = null
+        val desktopSongs = try {
+            val block = requestDesktopSearch(clean, searchType = 0, pageSize = 25)
+            parseDesktopSongCandidates(block, query = clean, extractLyricSnippet = false)
+                .map { it.song }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            firstError = e
+            emptyList()
+        }
+        if (desktopSongs.isNotEmpty()) return@withContext desktopSongs
+
+        // 兜底旧 CGI（无 new_json=1）
+        try {
+            val legacy = parseLegacySongSearch(requestLegacySearch(clean, searchType = 0))
+            if (legacy.isNotEmpty()) return@withContext legacy
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            if (firstError == null) firstError = e
+        }
+
+        firstError?.let { throw it }
+        emptyList()
     }
 
-    suspend fun searchSongsByLyrics(term: String): List<SongHit> = withContext(Dispatchers.IO) {
-        val root = requestSearch(term, searchType = 7)
-        if (root.optInt("code", 0) != 0) {
-            throw IllegalStateException("QQ 音乐歌词搜索失败（错误码 ${root.optInt("code")}）")
-        }
-        val songs = root.optJSONObject("data")
-            ?.optJSONObject("lyric")
-            ?.optJSONArray("list")
-            ?: return@withContext emptyList()
+    suspend fun searchSongsByLyrics(term: String): List<SongHit> =
+        searchSongsByLyricsWithSnippets(term).map { it.song }
 
-        buildList {
-            for (index in 0 until songs.length()) {
-                val item = songs.optJSONObject(index) ?: continue
-                val mid = item.optString("songmid").takeIf { it.isNotBlank() } ?: continue
-                val title = item.optString("songname").trim()
+    /**
+     * 按歌词片段搜歌（多引擎容灾）：
+     * 1. 主通道：QQ 音乐 `music.search.SearchCgiService.DoSearchForQQMusicDesktop` (`search_type = 7`)，
+     *    先走带 `zzc` 签名的 `musics.fcg`，失败时退回无 `comm` 的 `musicu.fcg`（自动对偶发 2001 重试）；
+     * 2. 备用通道 A：网易云音乐 `type = 1006` 歌词搜索（`cloudsearch/pc` → `search/get/web`）；
+     * 3. 备用通道 B：酷狗音乐 `songsearch.kugou.com/lyric_search`。
+     */
+    suspend fun searchSongsByLyricsWithSnippets(term: String): List<LyricSearchCandidate> = withContext(Dispatchers.IO) {
+        val clean = term.trim()
+        if (clean.isEmpty()) return@withContext emptyList()
+
+        var firstError: Exception? = null
+
+        // 1) QQ 音乐现代桌面搜索接口（search_type = 7）
+        try {
+            val block = requestDesktopSearch(clean, searchType = 7, pageSize = 10)
+            val qqHits = parseDesktopSongCandidates(block, query = clean, extractLyricSnippet = true)
+            if (qqHits.isNotEmpty()) return@withContext qqHits
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            firstError = e
+        }
+
+        // 2) 网易云音乐公开歌词检索（type = 1006）
+        try {
+            val neteaseHits = searchNeteaseByLyrics(clean, limit = 8)
+            if (neteaseHits.isNotEmpty()) return@withContext neteaseHits
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            if (firstError == null) firstError = e
+        }
+
+        // 3) 酷狗音乐公开歌词检索
+        try {
+            val kugouHits = searchKugouByLyrics(clean, limit = 8)
+            if (kugouHits.isNotEmpty()) return@withContext kugouHits
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            if (firstError == null) firstError = e
+        }
+
+        firstError?.let { throw it }
+        emptyList()
+    }
+
+    private suspend fun requestDesktopSearch(
+        term: String,
+        searchType: Int,
+        pageSize: Int
+    ): JSONObject {
+        val searchId = generateSearchId()
+        val param = JSONObject()
+            .put("grp", 1)
+            .put("num_per_page", pageSize)
+            .put("page_num", 1)
+            .put("query", term)
+            .put("remoteplace", "txt.newclient.top")
+            .put("search_type", searchType)
+            .put("searchid", searchId)
+
+        val moduleBlock = JSONObject()
+            .put("module", SEARCH_MODULE)
+            .put("method", "DoSearchForQQMusicDesktop")
+            .put("param", param)
+
+        var lastError: Exception? = null
+
+        // 通道 1：签名 musics.fcg（带桌面 comm，官方客户端 2026 现用协议）
+        try {
+            val signedBody = JSONObject()
+                .put(
+                    "comm",
+                    JSONObject()
+                        .put("ct", 19)
+                        .put("cv", 2151)
+                        .put("v", 2151)
+                        .put("_platform", "yqq.json")
+                        .put("guid", DEFAULT_GUID)
+                        .put("uin", "0")
+                )
+                .put(SEARCH_MODULE, moduleBlock)
+                .toString()
+            val sign = zzcSign(signedBody)
+            val root = JSONObject(request("$SIGNED_API_URL?sign=$sign", signedBody))
+            val block = root.optJSONObject(SEARCH_MODULE)
+            val code = root.optInt("code", 0).takeIf { it != 0 } ?: (block?.optInt("code", 0) ?: -1)
+            if (code == 0 && block != null && hasSearchList(block)) {
+                return block
+            }
+            if (code != 0) {
+                lastError = IllegalStateException("QQ 音乐搜索失败（错误码 $code）")
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            lastError = e
+        }
+
+        // 通道 2：无 comm 的 musicu.fcg（Web 公开通道要求信封键与模块名一致且不带 comm，偶发 2001 自动重试）
+        val unsignedBody = JSONObject()
+            .put(SEARCH_MODULE, moduleBlock)
+            .toString()
+        for (attempt in 0 until 4) {
+            try {
+                val root = JSONObject(request(API_URL, unsignedBody))
+                val block = root.optJSONObject(SEARCH_MODULE)
+                val code = root.optInt("code", 0).takeIf { it != 0 } ?: (block?.optInt("code", 0) ?: -1)
+                if (code == 0 && block != null) {
+                    return block
+                }
+                if (code == 2001 && attempt < 3) {
+                    delay(280L)
+                    continue
+                }
+                lastError = IllegalStateException("QQ 音乐搜索失败（错误码 $code）")
+                break
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastError = e
+                break
+            }
+        }
+
+        throw lastError ?: IllegalStateException("QQ 音乐搜索暂时不可用")
+    }
+
+    private fun hasSearchList(block: JSONObject): Boolean {
+        val body = block.optJSONObject("data")?.optJSONObject("body") ?: return false
+        val songList = body.optJSONObject("song")?.optJSONArray("list")
+        if (songList != null && songList.length() > 0) return true
+        val lyricList = body.optJSONObject("lyric")?.optJSONArray("list")
+        return lyricList != null && lyricList.length() > 0
+    }
+
+    private fun parseDesktopSongCandidates(
+        block: JSONObject,
+        query: String,
+        extractLyricSnippet: Boolean
+    ): List<LyricSearchCandidate> {
+        val body = block.optJSONObject("data")?.optJSONObject("body") ?: return emptyList()
+        val list = body.optJSONObject("song")?.optJSONArray("list")
+            ?.takeIf { it.length() > 0 }
+            ?: body.optJSONObject("lyric")?.optJSONArray("list")
+            ?: return emptyList()
+
+        return buildList {
+            for (index in 0 until list.length()) {
+                val raw = list.optJSONObject(index) ?: continue
+                val item = raw.optJSONObject("songInfo") ?: raw
+                val mid = item.optString("mid").ifBlank { item.optString("songmid") }.trim()
+                val songId = item.optString("id")
+                    .takeIf { it.isNotBlank() && it != "0" }
+                    ?: item.optString("songid").takeIf { it.isNotBlank() && it != "0" }
+                val effectiveId = mid.ifBlank { songId.orEmpty() }
+                if (effectiveId.isBlank()) continue
+
+                val title = item.optString("name")
+                    .ifBlank { item.optString("title") }
+                    .ifBlank { item.optString("songname") }
+                    .trim()
                 if (title.isBlank()) continue
-                val singer = item.optString("singer")
-                    .takeIf { it.isNotBlank() }
-                    ?: item.optString("content")
-                        .lineSequence()
-                        .firstOrNull()
-                        ?.let { line ->
-                            Regex("""^\s*.+?\s+-\s+(.+?)\s*(?:\([^)]*\))?\s*$""")
-                                .find(line)?.groupValues?.get(1)
-                                ?.replace(Regex("""\s*\([^)]*\)\s*$"""), "")
-                        }
-                        .orEmpty()
-                val albumMid = item.optString("albummid")
+
+                val artist = extractQqSingers(item)
+                val albumObj = item.optJSONObject("album")
+                val albumName = albumObj?.let {
+                    it.optString("name").ifBlank { it.optString("title") }
+                }.orEmpty().ifBlank { item.optString("albumname") }
+                val albumMid = albumObj?.let {
+                    it.optString("mid").ifBlank { it.optString("pmid") }
+                }.orEmpty().ifBlank { item.optString("albummid") }
+
+                val snippet = if (extractLyricSnippet) {
+                    extractMatchedLyricSnippet(
+                        highlight = raw.optString("lyric_hilight").ifBlank { item.optString("lyric_hilight") },
+                        lyric = raw.optString("lyric").ifBlank { item.optString("lyric") },
+                        content = raw.optString("content").ifBlank { item.optString("content") },
+                        query = query
+                    )
+                } else {
+                    ""
+                }
+
                 add(
-                    SongHit(
-                        id = mid,
-                        title = ChineseText.toSimplified(title),
-                        artist = ChineseText.toSimplified(singer.ifBlank { "未知艺人" }),
-                        album = ChineseText.toSimplified(item.optString("albumname")),
-                        artworkUrl = albumMid.takeIf { it.isNotBlank() }?.let {
-                            "https://y.gtimg.cn/music/photo_new/T002R300x300M000$it.jpg"
-                        }.orEmpty(),
-                        durationMs = item.optLong("interval") * 1000L,
-                        providerSongId = item.optString("songid").takeIf { it.isNotBlank() }
+                    LyricSearchCandidate(
+                        song = SongHit(
+                            id = effectiveId,
+                            title = ChineseText.toSimplified(title),
+                            artist = ChineseText.toSimplified(artist.ifBlank { "未知艺人" }),
+                            album = ChineseText.toSimplified(albumName),
+                            artworkUrl = albumMid.takeIf { it.isNotBlank() }?.let {
+                                "https://y.gtimg.cn/music/photo_new/T002R300x300M000$it.jpg"
+                            }.orEmpty(),
+                            durationMs = item.optLong("interval") * 1000L,
+                            providerSongId = songId
+                        ),
+                        lyricSnippet = snippet
                     )
                 )
             }
-        }.distinctBy { it.id }
+        }.distinctBy { it.song.id }
     }
 
-    private fun requestSearch(term: String, searchType: Int): JSONObject {
+    private fun extractQqSingers(item: JSONObject): String {
+        val singersArr = item.optJSONArray("singer")
+        if (singersArr != null && singersArr.length() > 0) {
+            val joined = (0 until singersArr.length())
+                .mapNotNull { singersArr.optJSONObject(it)?.optString("name")?.trim() }
+                .filter { it.isNotBlank() }
+                .joinToString(" / ")
+            if (joined.isNotBlank()) return joined
+        }
+        val rawSinger = item.optString("singer").trim()
+        if (rawSinger.isNotBlank() && !rawSinger.startsWith("[") && !rawSinger.startsWith("{")) {
+            return rawSinger
+        }
+        return item.optString("content")
+            .lineSequence()
+            .firstOrNull()
+            ?.let { line ->
+                Regex("""^\s*.+?\s+-\s+(.+?)\s*(?:\([^)]*\))?\s*$""")
+                    .find(line)?.groupValues?.get(1)
+                    ?.replace(Regex("""\s*\([^)]*\)\s*$"""), "")
+                    ?.trim()
+            }
+            .orEmpty()
+    }
+
+    private fun searchNeteaseByLyrics(term: String, limit: Int): List<LyricSearchCandidate> {
+        val encoded = URLEncoder.encode(term, Charsets.UTF_8.name())
+        val urls = listOf(
+            "https://music.163.com/api/cloudsearch/pc?s=$encoded&type=1006&offset=0&limit=$limit",
+            "https://music.163.com/api/search/get/web?s=$encoded&type=1006&offset=0&limit=$limit"
+        )
+        var lastError: Exception? = null
+        for (url in urls) {
+            try {
+                val text = request(url, referer = "https://music.163.com/")
+                val root = JSONObject(text)
+                if (root.optInt("code", -1) != 200) continue
+                val songs = root.optJSONObject("result")?.optJSONArray("songs") ?: continue
+                val parsed = parseNeteaseSongs(songs, term)
+                if (parsed.isNotEmpty()) return parsed
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        lastError?.let { throw it }
+        return emptyList()
+    }
+
+    private fun parseNeteaseSongs(songs: JSONArray, query: String): List<LyricSearchCandidate> = buildList {
+        for (i in 0 until songs.length()) {
+            val item = songs.optJSONObject(i) ?: continue
+            val id = item.optString("id").trim()
+            val title = item.optString("name").trim()
+            if (id.isBlank() || title.isBlank()) continue
+
+            val artistsArr = item.optJSONArray("ar") ?: item.optJSONArray("artists")
+            val artist = (0 until (artistsArr?.length() ?: 0))
+                .mapNotNull { artistsArr?.optJSONObject(it)?.optString("name")?.trim() }
+                .filter { it.isNotBlank() }
+                .joinToString(" / ")
+                .ifBlank { "未知艺人" }
+
+            val albumObj = item.optJSONObject("al") ?: item.optJSONObject("album")
+            val albumName = albumObj?.optString("name").orEmpty().trim()
+            val coverUrl = albumObj?.optString("picUrl").orEmpty().replace("http://", "https://")
+            val durationMs = item.optLong("dt").takeIf { it > 0L } ?: item.optLong("duration")
+
+            val lyricsObj = item.optJSONObject("lyrics")
+            val rawLyricsText = when {
+                lyricsObj != null -> {
+                    val arr = lyricsObj.optJSONArray("txt")
+                    if (arr != null) {
+                        (0 until arr.length())
+                            .mapNotNull { arr.optString(it) }
+                            .joinToString("\n")
+                    } else {
+                        lyricsObj.optString("txt")
+                    }
+                }
+                else -> {
+                    val arr = item.optJSONArray("lyrics")
+                    (0 until (arr?.length() ?: 0))
+                        .mapNotNull { arr?.optString(it) }
+                        .joinToString("\n")
+                }
+            }
+            val snippet = extractMatchedLyricSnippet(
+                highlight = rawLyricsText,
+                lyric = "",
+                content = "",
+                query = query
+            )
+
+            add(
+                LyricSearchCandidate(
+                    song = SongHit(
+                        id = "wy:$id",
+                        title = ChineseText.toSimplified(title),
+                        artist = ChineseText.toSimplified(artist),
+                        album = ChineseText.toSimplified(albumName),
+                        artworkUrl = coverUrl,
+                        durationMs = durationMs
+                    ),
+                    lyricSnippet = snippet
+                )
+            )
+        }
+    }.distinctBy { "${it.song.title}|${it.song.artist}" }
+
+    private fun searchKugouByLyrics(term: String, limit: Int): List<LyricSearchCandidate> {
+        val encoded = URLEncoder.encode(term, Charsets.UTF_8.name())
+        val url = "https://songsearch.kugou.com/lyric_search?keyword=$encoded&page=1&pagesize=$limit"
+        val root = JSONObject(request(url, referer = "https://www.kugou.com/"))
+        val lists = root.optJSONObject("data")?.optJSONArray("lists") ?: return emptyList()
+        return buildList {
+            for (i in 0 until lists.length()) {
+                val item = lists.optJSONObject(i) ?: continue
+                val hash = item.optString("FileHash").trim()
+                val title = stripHtmlTags(item.optString("SongName")).trim()
+                if (title.isBlank()) continue
+                val artist = stripHtmlTags(item.optString("SingerName")).trim().ifBlank { "未知艺人" }
+                val album = stripHtmlTags(item.optString("AlbumName")).trim()
+                val lyric = item.optString("Lyric")
+                val snippet = extractMatchedLyricSnippet(
+                    highlight = "",
+                    lyric = lyric.replace("  ", "\n"),
+                    content = "",
+                    query = term
+                )
+                add(
+                    LyricSearchCandidate(
+                        song = SongHit(
+                            id = if (hash.isNotBlank()) "kg:$hash" else "kg:$title|$artist",
+                            title = ChineseText.toSimplified(title),
+                            artist = ChineseText.toSimplified(artist),
+                            album = ChineseText.toSimplified(album),
+                            artworkUrl = "",
+                            durationMs = item.optLong("TimeLength") * 1000L
+                        ),
+                        lyricSnippet = snippet
+                    )
+                )
+            }
+        }.distinctBy { "${it.song.title}|${it.song.artist}" }
+    }
+
+    private fun extractMatchedLyricSnippet(
+        highlight: String,
+        lyric: String,
+        content: String,
+        query: String
+    ): String {
+        val cleanQuery = query.trim().lowercase(Locale.ROOT)
+        val candidates = listOf(highlight, lyric, content)
+        for (raw in candidates) {
+            if (raw.isBlank()) continue
+            val lines = raw.replace("\r\n", "\n").split('\n')
+            // 1. 优先命中带有高亮标签（<em> / <b>）的行
+            val emLine = lines.firstOrNull {
+                it.contains("<em", ignoreCase = true) || it.contains("<b", ignoreCase = true)
+            }
+            if (emLine != null) {
+                val cleaned = stripHtmlTags(emLine).trim()
+                if (cleaned.isNotBlank() && !isLyricCreditLine(cleaned)) {
+                    return ChineseText.toSimplified(cleaned)
+                }
+            }
+            // 2. 次选包含查询词的正文行（跳过“歌名 - 歌手”和“词/曲/编曲”抬头行）
+            if (cleanQuery.isNotEmpty()) {
+                val matched = lines.map { stripHtmlTags(it).trim() }.firstOrNull { line ->
+                    line.isNotBlank() &&
+                        !isLyricCreditLine(line) &&
+                        line.lowercase(Locale.ROOT).contains(cleanQuery)
+                }
+                if (matched != null) return ChineseText.toSimplified(matched)
+            }
+            // 3. 回退到第一条非抬头正文行
+            val firstLyric = lines.map { stripHtmlTags(it).trim() }.firstOrNull { line ->
+                line.isNotBlank() && !isLyricCreditLine(line) && !line.contains(" - ")
+            }
+            if (firstLyric != null) return ChineseText.toSimplified(firstLyric)
+        }
+        return ""
+    }
+
+    private fun isLyricCreditLine(line: String): Boolean {
+        val t = line.trim()
+        if (t.isEmpty()) return true
+        return Regex("""^(作词|作曲|词|曲|编曲|制作人|演唱|歌手|混音|母带|出品|发行|原唱|Lyricist|Composer|Arranger)\s*[:：]""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(t)
+    }
+
+    private fun stripHtmlTags(text: String): String =
+        text.replace(Regex("<[^>]*>"), "")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace(Regex("\\s+"), " ")
+
+    private fun generateSearchId(): String =
+        (UUID.randomUUID().toString().replace("-", "") + "12345")
+            .take(37)
+            .uppercase(Locale.ROOT)
+
+    private fun zzcSign(text: String): String {
+        val p1Idx = intArrayOf(23, 14, 6, 36, 16, 40, 7, 19)
+        val p2Idx = intArrayOf(16, 1, 32, 12, 19, 27, 8, 5)
+        val scramble = intArrayOf(
+            89, 39, 179, 150, 218, 82, 58, 252, 177, 52,
+            186, 123, 120, 64, 242, 133, 143, 161, 121, 179
+        )
+        val sha1Bytes = MessageDigest.getInstance("SHA-1").digest(text.toByteArray(Charsets.UTF_8))
+        val hex = buildString(sha1Bytes.size * 2) {
+            for (b in sha1Bytes) {
+                val v = b.toInt() and 0xFF
+                append(HEX_CHARS[v ushr 4])
+                append(HEX_CHARS[v and 0x0F])
+            }
+        }
+        val p1 = buildString {
+            for (idx in p1Idx) if (idx < hex.length) append(hex[idx])
+        }
+        val p2 = buildString {
+            for (idx in p2Idx) if (idx < hex.length) append(hex[idx])
+        }
+        val xored = ByteArray(scramble.size) { i ->
+            (scramble[i] xor (sha1Bytes[i].toInt() and 0xFF)).toByte()
+        }
+        val b64 = Base64.encodeToString(xored, Base64.NO_WRAP)
+            .replace("+", "")
+            .replace("/", "")
+            .replace("=", "")
+        return "zzc$p1$b64$p2".lowercase(Locale.ROOT)
+    }
+
+    private fun requestLegacySearch(term: String, searchType: Int): JSONObject {
         val encodedTerm = URLEncoder.encode(term.trim(), Charsets.UTF_8.name())
         val pageSize = if (searchType == 7) 10 else 25
         val root = JSONObject(
@@ -88,7 +525,7 @@ class QQMusicLyricsClient {
         return root
     }
 
-    private fun parseSongSearch(root: JSONObject): List<SongHit> {
+    private fun parseLegacySongSearch(root: JSONObject): List<SongHit> {
         val songs = root.optJSONObject("data")
             ?.optJSONObject("song")
             ?.optJSONArray("list")
@@ -589,11 +1026,15 @@ class QQMusicLyricsClient {
 
     private fun postJson(body: String): String = request(API_URL, body)
 
-    private fun request(url: String, body: String? = null): String {
+    private fun request(
+        url: String,
+        body: String? = null,
+        referer: String = "https://y.qq.com/"
+    ): String {
         val connection = URL(url).openConnection() as HttpURLConnection
         try {
-            connection.connectTimeout = 15_000
-            connection.readTimeout = 30_000
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 15_000
             if (body == null) {
                 connection.requestMethod = "GET"
             } else {
@@ -601,11 +1042,11 @@ class QQMusicLyricsClient {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             }
-            connection.setRequestProperty("Referer", "https://y.qq.com/")
+            connection.setRequestProperty("Referer", referer)
             connection.setRequestProperty(
                 "User-Agent",
-                "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             )
             if (body != null) {
                 connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(body) }
@@ -614,7 +1055,7 @@ class QQMusicLyricsClient {
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val response = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
             if (code !in 200..299) {
-                throw IllegalStateException("QQ 音乐请求失败（HTTP $code）")
+                throw IllegalStateException("请求失败（HTTP $code）")
             }
             return response
         } catch (t: Throwable) {
@@ -628,7 +1069,14 @@ class QQMusicLyricsClient {
 
     private companion object {
         const val API_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+        const val SIGNED_API_URL = "https://u.y.qq.com/cgi-bin/musics.fcg"
         const val SEARCH_URL = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
+        const val SEARCH_MODULE = "music.search.SearchCgiService"
+        const val DEFAULT_GUID = "1F70E520B2EAA7D25E11760783C53CA9"
+        val HEX_CHARS = charArrayOf(
+            '0', '1', '2', '3', '4', '5', '6', '7',
+            '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+        )
         const val MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024
         const val MAX_LYRIC_FETCH_ATTEMPTS = 4
         const val TRANSLATION_TIME_TOLERANCE_MS = 1_000L

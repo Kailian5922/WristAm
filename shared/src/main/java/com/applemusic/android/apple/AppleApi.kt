@@ -948,6 +948,185 @@ class AppleApi(private val prefs: TokenStore) {
         return merged
     }
 
+    /**
+     * Apple Music 原生歌词搜索：
+     * 通过 `amp-api.music.apple.com` 的 `with=lyricHighlights,lyrics,naturalLanguage,serverBubbles`
+     * 直接检索曲库歌词索引，并提取 `meta.snippets` 中的 `kind == "lyric"` 高亮片段；
+     * 非国区账号搜索中文歌词时额外补充国区检索并通过 ISRC 映射回当前账号区服，确保结果可直接播放。
+     */
+    fun searchSongsByLyrics(term: String, limit: Int = 15): List<AppleLyricSearchHit> {
+        val query = term.trim()
+        if (query.isEmpty()) return emptyList()
+
+        val sf = effectiveStorefront()
+        val safeLimit = limit.coerceIn(1, 25)
+        val queryHasHan = hasHanCharacters(query)
+        val queryHasKana = ArtistAliasTable.hasJapaneseKana(query)
+        val primaryLang = when {
+            queryHasKana -> "ja-JP"
+            queryHasHan -> "zh-Hans-CN"
+            else -> langTag(sf)
+        }
+
+        val hits = ArrayList<AppleLyricSearchHit>()
+        val seenIds = HashSet<String>()
+        var succeeded = 0
+        var firstError: Throwable? = null
+
+        fun ingest(batch: List<AppleLyricSearchHit>) {
+            for (item in batch) {
+                val id = item.song.id.trim()
+                if (id.isEmpty() || !seenIds.add(id)) continue
+                hits.add(item)
+            }
+        }
+
+        try {
+            ingest(searchLyricsOnce(query, safeLimit, primaryLang, sf))
+            succeeded++
+        } catch (e: Throwable) {
+            firstError = e
+            Logx.w(TAG, "searchSongsByLyrics primary failed ($sf/$primaryLang): ${e.message}")
+        }
+
+        if (sf != "cn" && queryHasHan) {
+            try {
+                val cnHits = searchLyricsOnce(
+                    term = query,
+                    limit = minOf(safeLimit, 15),
+                    lang = "zh-Hans-CN",
+                    sf = "cn"
+                )
+                succeeded++
+                val isrcs = cnHits.mapNotNull { it.song.isrc.takeIf(String::isNotBlank) }.distinct()
+                if (isrcs.isNotEmpty()) {
+                    val byIsrc = getCatalogSongsByIsrcs(isrcs, sf)
+                    val mapped = ArrayList<AppleLyricSearchHit>()
+                    for (cnHit in cnHits) {
+                        val key = cnHit.song.isrc.uppercase(Locale.ROOT)
+                        val matched = byIsrc[key] ?: continue
+                        matched.name = ChineseText.toSimplified(cnHit.song.name)
+                        matched.artistName = ChineseText.toSimplified(cnHit.song.artistName)
+                        matched.albumName = ChineseText.toSimplified(cnHit.song.albumName)
+                        mapped.add(
+                            AppleLyricSearchHit(
+                                song = matched,
+                                lyricSnippet = cnHit.lyricSnippet,
+                                hasLyricSnippet = cnHit.hasLyricSnippet
+                            )
+                        )
+                    }
+                    for (m in mapped.reversed()) {
+                        val existingIdx = hits.indexOfFirst { it.song.id == m.song.id }
+                        if (existingIdx >= 0) {
+                            if (m.hasLyricSnippet && !hits[existingIdx].hasLyricSnippet) {
+                                hits[existingIdx] = m
+                            }
+                        } else {
+                            seenIds.add(m.song.id)
+                            hits.add(0, m)
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                if (firstError == null) firstError = e
+                Logx.w(TAG, "searchSongsByLyrics cross-storefront cn failed: ${e.message}")
+            }
+        }
+
+        if (succeeded == 0 && firstError != null) {
+            throw RuntimeException("Apple Music 歌词搜索失败：${firstError.message}", firstError)
+        }
+
+        val songsToLocalize = hits.mapTo(ArrayList(hits.size)) { it.song }
+        if (songsToLocalize.isNotEmpty()) {
+            localizeCatalogSongs(songsToLocalize, "cn", resolveMissingByIsrc = false)
+        }
+
+        return hits.withIndex()
+            .sortedWith(
+                compareBy<IndexedValue<AppleLyricSearchHit>>(
+                    { if (it.value.hasLyricSnippet) 0 else 1 },
+                    { it.index }
+                )
+            )
+            .map { it.value }
+            .take(safeLimit)
+    }
+
+    private fun searchLyricsOnce(
+        term: String,
+        limit: Int,
+        lang: String,
+        sf: String
+    ): List<AppleLyricSearchHit> {
+        val effectiveSf = sf.ifBlank { effectiveStorefront() }
+        val safeLimit = limit.coerceIn(1, 25)
+        val enc = encodeQuery(term)
+        val path = "/v1/catalog/$effectiveSf/search?term=$enc" +
+            "&types=songs&limit=$safeLimit&l=$lang" +
+            "&format%5Bresources%5D=map&omit%5Bresource%5D=autos" +
+            "&with=lyricHighlights,lyrics,naturalLanguage,serverBubbles"
+        val root = JSONObject(ampGet(path))
+        val results = root.optJSONObject("results") ?: JSONObject()
+        val songResources = root.optJSONObject("resources")?.optJSONObject("songs")
+
+        val out = ArrayList<AppleLyricSearchHit>()
+        val seenIds = HashSet<String>()
+
+        fun extractSnippet(vararg objs: JSONObject?): String {
+            for (obj in objs) {
+                val snippets = obj?.optJSONObject("meta")?.optJSONArray("snippets") ?: continue
+                for (i in 0 until snippets.length()) {
+                    val item = snippets.optJSONObject(i) ?: continue
+                    if (!item.optString("kind", "").equals("lyric", ignoreCase = true)) continue
+                    val text = item.optString("text", "")
+                        .replace(Regex("<[^>]*>"), "")
+                        .replace("&amp;", "&")
+                        .replace("&quot;", "\"")
+                        .replace("&#39;", "'")
+                        .replace(Regex("\\s+"), " ")
+                        .trim()
+                    if (text.isNotBlank()) return ChineseText.toSimplified(text)
+                }
+            }
+            return ""
+        }
+
+        fun collectGroup(group: JSONObject?, filterSongsOnly: Boolean) {
+            val data = group?.optJSONArray("data") ?: return
+            for (i in 0 until data.length()) {
+                val ref = data.optJSONObject(i) ?: continue
+                val type = ref.optString("type", "")
+                if (filterSongsOnly && !type.equals("songs", ignoreCase = true)) continue
+                val id = ref.optString("id", "").trim()
+                if (id.isEmpty() || !seenIds.add(id)) continue
+
+                val hydrated = if (ref.optJSONObject("attributes") != null) {
+                    ref
+                } else {
+                    songResources?.optJSONObject(id) ?: continue
+                }
+                val parsed = pickSongs(JSONObject().put("data", JSONArray().put(hydrated)), "data", false)
+                    .firstOrNull() ?: continue
+                val snippet = extractSnippet(ref, hydrated)
+                out.add(
+                    AppleLyricSearchHit(
+                        song = parsed,
+                        lyricSnippet = snippet,
+                        hasLyricSnippet = snippet.isNotBlank()
+                    )
+                )
+            }
+        }
+
+        collectGroup(results.optJSONObject("top"), filterSongsOnly = true)
+        collectGroup(results.optJSONObject("topResults"), filterSongsOnly = true)
+        collectGroup(results.optJSONObject("song"), filterSongsOnly = false)
+        collectGroup(results.optJSONObject("songs"), filterSongsOnly = false)
+        return out
+    }
+
     /** 批量按目录艺人 ID 拉取指定语言下的艺人名称、曲风与官方头像。 */
     fun getCatalogArtistsByIds(
         artistIds: List<String>,

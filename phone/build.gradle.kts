@@ -13,8 +13,8 @@ android {
         applicationId = "com.kailian.wristam"
         minSdk = 24
         targetSdk = 36
-        versionCode = 20006
-        versionName = "2.0.6"
+        versionCode = 20007
+        versionName = "2.0.7"
     }
 
     signingConfigs {
