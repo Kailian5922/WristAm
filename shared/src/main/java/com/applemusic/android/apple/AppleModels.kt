@@ -122,6 +122,13 @@ data class AppleSearchResult(
     var playlists: MutableList<ApplePlaylist> = ArrayList()
 )
 
+/** Apple Music 原生歌词搜索命中项（含可选匹配歌词高亮片段）。 */
+data class AppleLyricSearchHit(
+    val song: AppleSong,
+    val lyricSnippet: String = "",
+    val hasLyricSnippet: Boolean = false
+)
+
 /** 分页返回。 */
 class PageResult<T> {
     var items: MutableList<T> = ArrayList()

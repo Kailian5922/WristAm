@@ -4,9 +4,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.applemusic.android.apple.AppleAlbum
 import com.applemusic.android.apple.AppleArtist
+import com.applemusic.android.apple.AppleLyricSearchHit
 import com.applemusic.android.apple.AppleSearchResult
 import com.applemusic.android.apple.ArtistAliasTable
 import com.applemusic.android.apple.MusicRepository
+import com.applemusic.lyricstool.data.LyricSearchCandidate
 import com.applemusic.lyricstool.data.QQMusicLyricsClient
 import com.applemusic.lyricstool.data.SongHit
 import com.applemusic.lyricstool.wear.data.ActiveDownload
@@ -54,6 +56,7 @@ data class SearchUiState(
     val artists: List<SearchedArtist> = emptyList(),
     val albums: List<SearchedAlbum> = emptyList(),
     val results: List<SongHit> = emptyList(),
+    val lyricSnippets: Map<String, String> = emptyMap(),
     val searching: Boolean = false,
     val status: String = "",
     val downloadedIds: Set<String> = emptySet(),
@@ -72,6 +75,7 @@ class SearchViewModel(
         val artists: List<SearchedArtist> = emptyList(),
         val albums: List<SearchedAlbum> = emptyList(),
         val results: List<SongHit> = emptyList(),
+        val lyricSnippets: Map<String, String> = emptyMap(),
         val searching: Boolean = false,
         val status: String = ""
     )
@@ -80,6 +84,7 @@ class SearchViewModel(
         val artists: List<SearchedArtist>,
         val albums: List<SearchedAlbum>,
         val songs: List<SongHit>,
+        val lyricSnippets: Map<String, String> = emptyMap(),
         val note: String
     )
 
@@ -96,6 +101,7 @@ class SearchViewModel(
             artists = local.artists,
             albums = local.albums,
             results = local.results,
+            lyricSnippets = local.lyricSnippets,
             searching = local.searching,
             status = local.status,
             downloadedIds = dl.downloadedIds,
@@ -108,7 +114,13 @@ class SearchViewModel(
     }
 
     fun toggleSearchByLyrics() {
-        localState.update { it.copy(searchByLyrics = !it.searchByLyrics) }
+        localState.update {
+            it.copy(
+                searchByLyrics = !it.searchByLyrics,
+                status = "",
+                lyricSnippets = emptyMap()
+            )
+        }
     }
 
     fun performSearch() {
@@ -123,12 +135,7 @@ class SearchViewModel(
             try {
                 val combined = withContext(Dispatchers.IO) {
                     if (byLyrics) {
-                        CombinedSearchResult(
-                            artists = emptyList(),
-                            albums = emptyList(),
-                            songs = searchByLyricsParallel(trimmed),
-                            note = ""
-                        )
+                        searchByLyricsParallel(trimmed)
                     } else {
                         searchCombinedWithOfflineFallback(trimmed)
                     }
@@ -145,6 +152,7 @@ class SearchViewModel(
                         artists = combined.artists,
                         albums = combined.albums,
                         results = combined.songs,
+                        lyricSnippets = combined.lyricSnippets,
                         searching = false,
                         status = statusMsg
                     )
@@ -162,15 +170,58 @@ class SearchViewModel(
         }
     }
 
-    private suspend fun searchByLyricsParallel(trimmed: String): List<SongHit> = coroutineScope {
-        val qqHits = qqMusicClient.searchSongsByLyrics(trimmed).take(6)
-        if (qqHits.isEmpty()) return@coroutineScope emptyList()
+    /**
+     * 双通道并行歌词搜歌：
+     * 1. Apple Music 原生歌词索引检索（`with=lyricHighlights,lyrics,naturalLanguage,serverBubbles`），
+     *    直接返回可播放曲目与官方歌词高亮片段，支持中/英/日/韩全语种；
+     * 2. QQ 音乐现代桌面歌词搜索（`DoSearchForQQMusicDesktop search_type=7`）+ 网易云 `1006` + 酷狗兜底，
+     *    再并行回查 Apple Music 目录匹配最贴合曲目；
+     * 任一通道异常互不影响，避免单点接口波动导致整个歌词搜索不可用。
+     */
+    private suspend fun searchByLyricsParallel(trimmed: String): CombinedSearchResult = coroutineScope {
+        val appleNativeDeferred = async(Dispatchers.IO) {
+            try {
+                Result.success(MusicRepository.api.searchSongsByLyrics(trimmed, limit = 15))
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Result.failure<List<AppleLyricSearchHit>>(e)
+            }
+        }
 
-        val perHitLists = qqHits.map { hit ->
+        val externalDeferred = async(Dispatchers.IO) {
+            try {
+                Result.success(qqMusicClient.searchSongsByLyricsWithSnippets(trimmed).take(6))
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Result.failure<List<LyricSearchCandidate>>(e)
+            }
+        }
+
+        val appleResult = appleNativeDeferred.await()
+        val externalResult = externalDeferred.await()
+        val appleNativeHits = appleResult.getOrDefault(emptyList())
+        val externalCandidates = externalResult.getOrDefault(emptyList())
+
+        val resolvedExternalBatches = externalCandidates.map { candidate ->
             async(Dispatchers.IO) {
                 try {
-                    val term = "${hit.title} ${hit.artist}".trim()
-                    MusicRepository.searchCatalog(term, 4).songs.map { it.toSongHit() }
+                    val artistPart = candidate.song.artist
+                        .takeUnless { it.isBlank() || it == "未知艺人" }
+                        .orEmpty()
+                    val queryTerm = listOf(candidate.song.title, artistPart)
+                        .filter { it.isNotBlank() }
+                        .joinToString(" ")
+                        .trim()
+                    if (queryTerm.isEmpty()) return@async emptyList()
+                    val catalogSongs = MusicRepository.searchCatalog(queryTerm, 5)
+                        .songs
+                        .map { it.toSongHit() }
+                    selectBestAppleMatches(candidate.song, catalogSongs)
+                        .map { it to candidate.lyricSnippet }
+                } catch (ce: CancellationException) {
+                    throw ce
                 } catch (_: Exception) {
                     emptyList()
                 }
@@ -178,27 +229,101 @@ class SearchViewModel(
         }.awaitAll()
 
         val merged = ArrayList<SongHit>()
+        val snippets = LinkedHashMap<String, String>()
         val seenIds = HashSet<String>()
         val seenSig = HashSet<String>()
-        for (batch in perHitLists) {
-            for (song in batch) {
-                val rawId = song.id.trim()
-                val primaryId = song.providerSongId?.trim()?.ifBlank { rawId } ?: rawId
-                val sigKey = normalizeSignature(song.title, song.artist)
-                if ((rawId.isNotEmpty() && rawId in seenIds) ||
-                    (primaryId.isNotEmpty() && primaryId in seenIds) ||
-                    sigKey in seenSig
-                ) {
-                    continue
+
+        fun addSong(song: SongHit, snippet: String) {
+            if (merged.size >= 15) return
+            val rawId = song.id.trim()
+            val primaryId = song.providerSongId?.trim()?.ifBlank { rawId } ?: rawId
+            val sigKey = normalizeSignature(song.title, song.artist)
+            if ((rawId.isNotEmpty() && rawId in seenIds) ||
+                (primaryId.isNotEmpty() && primaryId in seenIds) ||
+                sigKey in seenSig
+            ) {
+                if (snippet.isNotBlank() && rawId.isNotEmpty() && snippets[rawId].isNullOrBlank()) {
+                    snippets[rawId] = snippet
                 }
-                if (rawId.isNotEmpty()) seenIds.add(rawId)
-                if (primaryId.isNotEmpty()) seenIds.add(primaryId)
-                seenSig.add(sigKey)
-                merged.add(song)
-                if (merged.size >= 15) return@coroutineScope merged
+                return
+            }
+            if (rawId.isNotEmpty()) seenIds.add(rawId)
+            if (primaryId.isNotEmpty()) seenIds.add(primaryId)
+            seenSig.add(sigKey)
+            merged.add(song)
+            if (snippet.isNotBlank() && rawId.isNotEmpty()) {
+                snippets[rawId] = snippet
             }
         }
-        merged
+
+        // 1) Apple Music 官方明确命中歌词高亮的曲目最优先
+        for (hit in appleNativeHits) {
+            if (hit.hasLyricSnippet) {
+                addSong(hit.song.toSongHit(), hit.lyricSnippet)
+            }
+        }
+        // 2) QQ / 网易云 / 酷狗歌词搜歌命中并已映射到 Apple Music 目录的曲目
+        for (batch in resolvedExternalBatches) {
+            for ((song, snippet) in batch) {
+                addSong(song, snippet)
+            }
+        }
+        // 3) 其余 Apple Music 自然语言/歌词索引召回的曲目
+        for (hit in appleNativeHits) {
+            if (!hit.hasLyricSnippet) {
+                addSong(hit.song.toSongHit(), hit.lyricSnippet)
+            }
+        }
+
+        val appleErr = appleResult.exceptionOrNull()
+        val externalErr = externalResult.exceptionOrNull()
+        if (merged.isEmpty() && appleErr != null && externalErr != null) {
+            throw appleErr
+        }
+
+        CombinedSearchResult(
+            artists = emptyList(),
+            albums = emptyList(),
+            songs = merged,
+            lyricSnippets = snippets,
+            note = ""
+        )
+    }
+
+    private fun selectBestAppleMatches(expected: SongHit, candidates: List<SongHit>): List<SongHit> {
+        if (candidates.isEmpty()) return emptyList()
+        val expectedTitle = ArtistAliasTable.normalizeKey(expected.title)
+        val expectedArtists = expected.artist
+            .takeUnless { it == "未知艺人" }
+            .orEmpty()
+            .split(Regex("[,/&、，;]+"))
+            .map { ArtistAliasTable.normalizeKey(it) }
+            .filter { it.isNotEmpty() }
+
+        val scored = candidates.mapIndexedNotNull { idx, song ->
+            val actualTitle = ArtistAliasTable.normalizeKey(song.title)
+            val titleScore = when {
+                expectedTitle.isBlank() || actualTitle.isBlank() -> 0
+                actualTitle == expectedTitle -> 100
+                actualTitle.contains(expectedTitle) || expectedTitle.contains(actualTitle) -> 70
+                else -> 0
+            }
+            val actualArtist = ArtistAliasTable.normalizeKey(song.artist)
+            val artistMatched = expectedArtists.isNotEmpty() && actualArtist.isNotBlank() &&
+                expectedArtists.any { exp ->
+                    actualArtist == exp ||
+                        (exp.length >= 2 && actualArtist.contains(exp)) ||
+                        (actualArtist.length >= 2 && exp.contains(actualArtist))
+                }
+            val score = titleScore + (if (artistMatched) 40 else 0) - idx * 3
+            if (titleScore > 0 || artistMatched) song to score else null
+        }.sortedByDescending { it.second }
+
+        return if (scored.isNotEmpty()) {
+            scored.take(2).map { it.first }
+        } else {
+            candidates.take(1)
+        }
     }
 
     private fun searchCombinedWithOfflineFallback(trimmed: String): CombinedSearchResult {

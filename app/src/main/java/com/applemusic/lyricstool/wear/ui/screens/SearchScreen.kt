@@ -352,6 +352,20 @@ fun SearchScreen(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                val lyricSnippet = if (state.searchByLyrics && activeDownload == null) {
+                                    state.lyricSnippets[song.id].orEmpty()
+                                } else {
+                                    ""
+                                }
+                                if (lyricSnippet.isNotBlank()) {
+                                    Text(
+                                        text = "「$lyricSnippet」",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                             Spacer(modifier = Modifier.width(4.dp))
                             SongDownloadActionButton(
